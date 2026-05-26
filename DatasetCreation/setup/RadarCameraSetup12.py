@@ -10,7 +10,7 @@ _dc_entry.bootstrap(__file__)
 
 import colorsys
 import math
-import msvcrt
+from _kbhit_compat import enter_pressed
 import os
 import time
 
@@ -451,10 +451,8 @@ def main():
                         color=rcolor,
                     )
 
-            if not KEEP_SENSORS_RUNNING and msvcrt.kbhit():
-                key = msvcrt.getwch()
-                if key in ("\r", "\n"):
-                    break
+            if not KEEP_SENSORS_RUNNING and enter_pressed():
+                break
 
             time.sleep(marker_refresh_s)
 

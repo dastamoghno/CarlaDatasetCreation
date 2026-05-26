@@ -19,7 +19,7 @@ import traceback
 from pathlib import Path
 
 import carla
-import msvcrt
+from _kbhit_compat import enter_pressed
 
 from carla_connect import get_world
 from capture.ExportCameraExtrinsics import write_camera_extrinsics_to_dataset_dir
@@ -2067,10 +2067,8 @@ def main():
                 drain_radar_queue()
                 drained_any = True
             radar_watchdog_check()
-            if msvcrt.kbhit():
-                key = msvcrt.getwch()
-                if key in ("\r", "\n"):
-                    break
+            if enter_pressed():
+                break
 
             now = time.time()
             if now - last_print >= 2.0:

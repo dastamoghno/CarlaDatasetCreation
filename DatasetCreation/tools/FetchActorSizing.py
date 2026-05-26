@@ -40,7 +40,7 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_dc_entry)
 _dc_entry.bootstrap(__file__)
 
-import msvcrt
+from _kbhit_compat import enter_pressed
 import os
 import time
 from collections import defaultdict
@@ -348,7 +348,7 @@ def watch_currently_spawned(world):
                 world, actor, BBOX_WALKER_COLOR, WATCH_LIFETIME_S, label=label
             )
 
-        if msvcrt.kbhit() and msvcrt.getwch() in ("\r", "\n"):
+        if enter_pressed():
             break
 
         time.sleep(WATCH_REFRESH_S)
