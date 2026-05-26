@@ -38,7 +38,8 @@ import traceback
 from pathlib import Path
 
 import carla
-import msvcrt
+
+from _kbhit_compat import enter_pressed
 
 from carla_connect import carla_timeout_s
 from capture.CaptureRadarCameraData import (
@@ -430,7 +431,7 @@ def run_test(
                     flush=True,
                 )
                 break
-            if msvcrt.kbhit() and msvcrt.getwch() in ("\r", "\n"):
+            if enter_pressed():
                 break
 
             now = time.time()
