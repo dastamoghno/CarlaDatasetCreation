@@ -487,17 +487,101 @@ class RadarActorSnapshotCache:
     so radar messages can be matched against the exact frame they belong to —
     even when processing falls behind or runs after Ctrl+C. This class remains
     for legacy code paths and is no longer used by the main capture loop.
+
+    Per-actor static metadata (bbox, type_id, class_label) is cached across
+    frames — ``actor.bounding_box`` is a ~4 ms CARLA RPC and never changes for
+    a spawned actor, so refetching it every frame dominates the test-loop
+    drain time. Only ``get_transform()`` (location + rotation) is refreshed
+    per frame.
     """
 
     def __init__(self, world) -> None:
         self._world = world
         self._frame: int | None = None
         self._snapshots: list = []
+        # actor_id -> static meta dict: id, kind, type_id, class_label, bbox
+        self._meta_cache: dict[int, dict] = {}
+
+    def _build_meta(self, actor, kind: str, class_label: str) -> dict:
+        bbox = actor.bounding_box  # 1 RPC, cached for the lifetime of the actor
+        bbox_rotation = None
+        if bbox.rotation is not None:
+            bbox_rotation = {
+                "pitch": float(bbox.rotation.pitch),
+                "yaw": float(bbox.rotation.yaw),
+                "roll": float(bbox.rotation.roll),
+            }
+        return {
+            "id": int(actor.id),
+            "kind": kind,
+            "type_id": actor.type_id,
+            "class_label": class_label,
+            "bbox": {
+                "location": {
+                    "x": float(bbox.location.x),
+                    "y": float(bbox.location.y),
+                    "z": float(bbox.location.z),
+                },
+                "extent": {
+                    "x": float(bbox.extent.x),
+                    "y": float(bbox.extent.y),
+                    "z": float(bbox.extent.z),
+                },
+                "rotation": bbox_rotation,
+            },
+        }
+
+    def _snapshot_with_cache(self, actor, kind: str, class_label: str) -> dict | None:
+        try:
+            actor_tf = actor.get_transform()
+        except RuntimeError:
+            return None
+        aid = int(actor.id)
+        meta = self._meta_cache.get(aid)
+        if meta is None:
+            try:
+                meta = self._build_meta(actor, kind, class_label)
+            except RuntimeError:
+                return None
+            self._meta_cache[aid] = meta
+        # Fresh-per-frame fields (cheap): location + rotation.
+        return {
+            **meta,
+            "location": actor_tf.location,
+            "rotation": {
+                "pitch": float(actor_tf.rotation.pitch),
+                "yaw": float(actor_tf.rotation.yaw),
+                "roll": float(actor_tf.rotation.roll),
+            },
+        }
+
+    def _build_snapshots(self) -> list:
+        snapshots: list = []
+        seen_ids: set[int] = set()
+        for vehicle in self._world.get_actors().filter("vehicle.*"):
+            snap = self._snapshot_with_cache(
+                vehicle, "vehicle", vehicle_class_from_type_id(vehicle.type_id)
+            )
+            if snap is not None:
+                snapshots.append(snap)
+                seen_ids.add(int(vehicle.id))
+        for walker in self._world.get_actors().filter("walker.pedestrian.*"):
+            snap = self._snapshot_with_cache(
+                walker, "pedestrian", pedestrian_class_from_type_id(walker.type_id)
+            )
+            if snap is not None:
+                snapshots.append(snap)
+                seen_ids.add(int(walker.id))
+        # Drop stale meta entries so destroyed actors don't leak memory.
+        stale = [aid for aid in self._meta_cache if aid not in seen_ids]
+        for aid in stale:
+            self._meta_cache.pop(aid, None)
+        return snapshots
 
     def get(self, frame_id: int):
         if self._frame != frame_id:
             self._frame = frame_id
-            self._snapshots = get_radar_target_snapshots(self._world)
+            self._snapshots = self._build_snapshots()
         return self._snapshots
 
 
@@ -725,6 +809,14 @@ def _detection_beam_yaw_deg(sensor_transform, detection):
 
 
 def _actor_bbox_world_center_and_extent(world, actor_snapshot):
+    # Fast path: per-frame precompute populates these once per actor (see
+    # precompute_actor_frame_cache). Saves ~270 carla.Transform.transform() calls
+    # per radar message in the test loop.
+    cached_center = actor_snapshot.get("_world_center")
+    cached_extent = actor_snapshot.get("_extent")
+    if cached_center is not None and cached_extent is not None:
+        return cached_center, cached_extent
+
     bbox = actor_snapshot.get("bbox")
     if bbox and actor_snapshot.get("location") and actor_snapshot.get("rotation"):
         rot = actor_snapshot["rotation"]
@@ -749,6 +841,54 @@ def _actor_bbox_world_center_and_extent(world, actor_snapshot):
     actor_tf = actor.get_transform()
     center = actor_tf.transform(bbox.location)
     return center, bbox.extent
+
+
+def precompute_actor_frame_cache(actors, world=None):
+    """Populate per-actor cached quantities used by the radar labeling hot path.
+
+    For each actor snapshot with a logged bbox + location + rotation, computes:
+      _world_center      : carla.Location, bbox center in world coords
+      _extent            : carla.Vector3D, bbox extent
+      _max_extent_xy_m   : float, max planar extent (for beam angular gate)
+      _inv_actor_tf      : carla.Transform(loc=0, rot=-actor_rot) — pre-built
+                           rotation-only inverse, reused by actor_bbox_margin_m
+      _inv_bbox_tf       : same for bbox local rotation, when bbox has rotation
+
+    All keys are sensor-independent, so a single call per frame covers every
+    detection from every radar firing at that frame. Idempotent (skips actors
+    already cached).
+    """
+    for actor in actors:
+        if "_world_center" in actor:
+            continue
+        center, extent = _actor_bbox_world_center_and_extent(world, actor)
+        if center is None or extent is None:
+            continue
+        actor["_world_center"] = center
+        actor["_extent"] = extent
+        actor["_max_extent_xy_m"] = math.hypot(extent.x, extent.y)
+        rot = actor.get("rotation") or {}
+        try:
+            inv_rot = carla.Rotation(
+                pitch=-float(rot.get("pitch", 0.0)),
+                yaw=-float(rot.get("yaw", 0.0)),
+                roll=-float(rot.get("roll", 0.0)),
+            )
+            actor["_inv_actor_tf"] = carla.Transform(carla.Location(), inv_rot)
+        except Exception:  # noqa: BLE001
+            pass
+        bbox = actor.get("bbox") or {}
+        bbox_rot = bbox.get("rotation")
+        if bbox_rot:
+            try:
+                inv_brot = carla.Rotation(
+                    pitch=-float(bbox_rot.get("pitch", 0.0)),
+                    yaw=-float(bbox_rot.get("yaw", 0.0)),
+                    roll=-float(bbox_rot.get("roll", 0.0)),
+                )
+                actor["_inv_bbox_tf"] = carla.Transform(carla.Location(), inv_brot)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def actor_snapshot_in_sensor_fov(
@@ -793,7 +933,9 @@ def actor_visible_in_detection_beam(
 
     sensor_loc = sensor_transform.location
     range_m, bearing_deg = _planar_range_bearing_deg(sensor_loc, center)
-    max_extent_m = math.hypot(extent.x, extent.y)
+    max_extent_m = actor_snapshot.get("_max_extent_xy_m")
+    if max_extent_m is None:
+        max_extent_m = math.hypot(extent.x, extent.y)
     depth = float(detection.depth)
     depth_min = max(0.0, depth - depth_margin_m - max_extent_m)
     depth_max = min(max_range_m, depth + depth_margin_m + max_extent_m)
@@ -963,8 +1105,37 @@ def actor_bbox_margin_m(world, hit_location, actor_snapshot, inflation_m=BBOX_MA
     """
     Signed margin to the actor OBB in meters: 0 if inside (with optional inflation),
     otherwise the shortest distance from the hit to the box surface.
+
+    Fast path: when precompute_actor_frame_cache has populated _world_center,
+    _extent, _inv_actor_tf (and optionally _inv_bbox_tf), skips reconstructing
+    Transform objects per call.
     """
     logged_bbox = actor_snapshot.get("bbox")
+    cached_center = actor_snapshot.get("_world_center")
+    cached_extent = actor_snapshot.get("_extent")
+    cached_inv_actor_tf = actor_snapshot.get("_inv_actor_tf")
+    cached_inv_bbox_tf = actor_snapshot.get("_inv_bbox_tf")  # may be None
+    if (
+        cached_center is not None
+        and cached_extent is not None
+        and cached_inv_actor_tf is not None
+    ):
+        delta = carla.Location(
+            hit_location.x - cached_center.x,
+            hit_location.y - cached_center.y,
+            hit_location.z - cached_center.z,
+        )
+        local = cached_inv_actor_tf.transform(delta)
+        if cached_inv_bbox_tf is not None:
+            local = cached_inv_bbox_tf.transform(local)
+        inflation = inflation_m
+        dx = max(0.0, abs(local.x) - (cached_extent.x + inflation))
+        dy = max(0.0, abs(local.y) - (cached_extent.y + inflation))
+        dz = max(0.0, abs(local.z) - (cached_extent.z + inflation))
+        if dx == 0.0 and dy == 0.0 and dz == 0.0:
+            return 0.0
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+
     if logged_bbox and actor_snapshot.get("location") and actor_snapshot.get("rotation"):
         rot = actor_snapshot["rotation"]
         actor_tf = carla.Transform(
@@ -1038,22 +1209,26 @@ def vehicle_hit_distance_m(world, hit_location, vehicle_snapshot):
     return hit_location.distance(vehicle_snapshot["location"])
 
 
-def actor_rcs_proxy_projected_area_m2(world, actor_id, sensor_location):
+def actor_rcs_proxy_projected_area_m2(actor_snapshot, sensor_location):
     """
     Sum of (face area × cos θ) for OBB faces visible from the sensor direction — a geometric
-    RCS surrogate (m²). Not physical radar cross section; empty if the actor is unavailable.
-    """
-    try:
-        actor = world.get_actor(int(actor_id))
-    except (RuntimeError, ValueError, OverflowError):
-        return ""
-    if actor is None:
-        return ""
+    RCS surrogate (m²). Not physical radar cross section; empty if the snapshot is malformed.
 
-    bbox = actor.bounding_box
-    actor_tf = actor.get_transform()
-    extent = bbox.extent
-    ex, ey, ez = extent.x, extent.y, extent.z
+    Reads bbox + transform from the cached snapshot dict produced by
+    ``TickActorSnapshotter`` / ``RadarActorSnapshotCache`` — no CARLA RPCs.
+    """
+    if not actor_snapshot:
+        return ""
+    bbox = actor_snapshot.get("bbox")
+    actor_loc = actor_snapshot.get("location")
+    actor_rot = actor_snapshot.get("rotation")
+    if not bbox or actor_loc is None or actor_rot is None:
+        return ""
+    extent = bbox.get("extent") or {}
+    bbox_loc = bbox.get("location") or {}
+    ex = float(extent.get("x", 0.0))
+    ey = float(extent.get("y", 0.0))
+    ez = float(extent.get("z", 0.0))
     face_specs = [
         ((1.0, 0.0, 0.0), 4.0 * ey * ez),
         ((-1.0, 0.0, 0.0), 4.0 * ey * ez),
@@ -1063,7 +1238,21 @@ def actor_rcs_proxy_projected_area_m2(world, actor_id, sensor_location):
         ((0.0, 0.0, -1.0), 4.0 * ex * ey),
     ]
 
-    center_world = actor_tf.transform(bbox.location)
+    actor_tf = carla.Transform(
+        snapshot_location(actor_snapshot),
+        carla.Rotation(
+            pitch=float(actor_rot.get("pitch", 0.0)),
+            yaw=float(actor_rot.get("yaw", 0.0)),
+            roll=float(actor_rot.get("roll", 0.0)),
+        ),
+    )
+    center_world = actor_tf.transform(
+        carla.Location(
+            x=float(bbox_loc.get("x", 0.0)),
+            y=float(bbox_loc.get("y", 0.0)),
+            z=float(bbox_loc.get("z", 0.0)),
+        )
+    )
     vx = sensor_location.x - center_world.x
     vy = sensor_location.y - center_world.y
     vz = sensor_location.z - center_world.z
@@ -1072,11 +1261,22 @@ def actor_rcs_proxy_projected_area_m2(world, actor_id, sensor_location):
         return ""
     ux, uy, uz = vx / vl, vy / vl, vz / vl
 
+    bbox_rot_dict = bbox.get("rotation")
+    if bbox_rot_dict:
+        bbox_rotation = carla.Rotation(
+            pitch=float(bbox_rot_dict.get("pitch", 0.0)),
+            yaw=float(bbox_rot_dict.get("yaw", 0.0)),
+            roll=float(bbox_rot_dict.get("roll", 0.0)),
+        )
+    else:
+        bbox_rotation = carla.Rotation()
+    bbox_tf = carla.Transform(carla.Location(), bbox_rotation)
+    world_tf = carla.Transform(carla.Location(), actor_tf.rotation)
+
     projected = 0.0
     for (lx, ly, lz), area in face_specs:
-        loc_n = carla.Location(x=lx, y=ly, z=lz)
-        n_bbox = carla.Transform(carla.Location(), bbox.rotation).transform(loc_n)
-        n_world = carla.Transform(carla.Location(), actor_tf.rotation).transform(n_bbox)
+        n_bbox = bbox_tf.transform(carla.Location(x=lx, y=ly, z=lz))
+        n_world = world_tf.transform(n_bbox)
         nx, ny, nz = n_world.x, n_world.y, n_world.z
         nl = math.sqrt(nx * nx + ny * ny + nz * nz)
         if nl < 1e-9:
@@ -1089,8 +1289,8 @@ def actor_rcs_proxy_projected_area_m2(world, actor_id, sensor_location):
     return f"{projected:.6f}"
 
 
-def vehicle_rcs_proxy_projected_area_m2(world, vehicle_actor_id, sensor_location):
-    return actor_rcs_proxy_projected_area_m2(world, vehicle_actor_id, sensor_location)
+def vehicle_rcs_proxy_projected_area_m2(vehicle_snapshot, sensor_location):
+    return actor_rcs_proxy_projected_area_m2(vehicle_snapshot, sensor_location)
 
 
 def match_detection_to_actor(
@@ -1330,6 +1530,7 @@ def evaluate_radar_detection_label(
     actor_kind = ""
     actor_type_id = ""
     actor_class = ""
+    actor_snapshot = None
     match_bbox_margin_m = None
     nearest_bbox_margin_m = None
 
@@ -1352,6 +1553,7 @@ def evaluate_radar_detection_label(
             actor_kind = ma["kind"]
             actor_type_id = ma["type_id"]
             actor_class = ma["class_label"]
+            actor_snapshot = ma
             match_bbox_margin_m = margin
             nearest_bbox_margin_m = margin
 
@@ -1371,6 +1573,7 @@ def evaluate_radar_detection_label(
         "actor_kind": actor_kind,
         "actor_type_id": actor_type_id,
         "actor_class": actor_class,
+        "actor_snapshot": actor_snapshot,
         "match_bbox_margin_m": match_bbox_margin_m,
         "nearest_bbox_margin_m": nearest_bbox_margin_m,
         "velocity_mps": velocity_mps,
@@ -1513,7 +1716,7 @@ def process_radar_measurement_for_capture(
 
         rcs_proxy_m2 = ""
         if matched_actor_id:
-            rcs_proxy_m2 = actor_rcs_proxy_projected_area_m2(world, matched_actor_id, loc)
+            rcs_proxy_m2 = actor_rcs_proxy_projected_area_m2(label["actor_snapshot"], loc)
 
         rows.append(
             [

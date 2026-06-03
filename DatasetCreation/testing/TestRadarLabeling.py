@@ -61,6 +61,7 @@ from capture.CaptureRadarCameraData import (
     evaluate_radar_detection_label,
     filter_tagged_sensors,
     list_radar_actors,
+    precompute_actor_frame_cache,
     radar_detection_world_location,
     radar_candidate_hit_max_bbox_margin_m,
     radar_sensor_limits,
@@ -278,11 +279,34 @@ def run_test(
     debug_counter = [0]
     actor_cache = RadarActorSnapshotCache(world)
     radar_queue = make_radar_measurement_buffer()
+    # Per-radar arrival instrumentation: when did each sensor's first/last msg arrive
+    # at our callback, and how many did each sensor try to deliver.
+    per_radar_stats: dict[str, dict] = {}
+    per_radar_lock = threading.Lock()
+    # Worker pool for the per-message labeling work. Env: DATASET_RADAR_LABEL_WORKERS
+    # (default 4). 1 disables the pool (single-threaded drain).
+    try:
+        _worker_count = max(1, int(os.environ.get("DATASET_RADAR_LABEL_WORKERS", "4")))
+    except ValueError:
+        _worker_count = 4
+    label_executor = None
+    if _worker_count > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        label_executor = ThreadPoolExecutor(
+            max_workers=_worker_count, thread_name_prefix="radar-label"
+        )
+        print(
+            f"{RADAR_TEST_LOG_PREFIX} drain pool: {_worker_count} workers",
+            flush=True,
+        )
+    else:
+        print(f"{RADAR_TEST_LOG_PREFIX} drain pool: disabled (single-threaded)", flush=True)
 
-    def process_radar_measurement(sensor_label: str, radar_actor, measurement) -> None:
+    def process_radar_measurement(sensor_label: str, radar_actor, measurement, actors=None) -> None:
         collector.record_message(raw_returns=len(measurement))
         sensor_transform = measurement.transform
-        actors = actor_cache.get(int(measurement.frame))
+        if actors is None:
+            actors = actor_cache.get(int(measurement.frame))
         range_m, hfov_deg = radar_sensor_limits(radar_actor)
 
         for detection in measurement:
@@ -349,13 +373,58 @@ def run_test(
             )
             if not batch:
                 break
+            # Resolve actor snapshots per unique frame on the main thread (cache
+            # mutation must not race with workers), and precompute world-space
+            # bbox center / inverse rotations once per frame so all messages
+            # in this batch share the work.
+            frame_actors_cache: dict[int, list] = {}
             for sensor_label, radar_actor, measurement in batch:
-                process_radar_measurement(sensor_label, radar_actor, measurement)
+                fid = int(measurement.frame)
+                if fid not in frame_actors_cache:
+                    actors = actor_cache.get(fid)
+                    precompute_actor_frame_cache(actors, world)
+                    frame_actors_cache[fid] = actors
+            if label_executor is None:
+                for sensor_label, radar_actor, measurement in batch:
+                    process_radar_measurement(
+                        sensor_label, radar_actor, measurement,
+                        frame_actors_cache[int(measurement.frame)],
+                    )
+            else:
+                futures = [
+                    label_executor.submit(
+                        process_radar_measurement,
+                        sensor_label, radar_actor, measurement,
+                        frame_actors_cache[int(measurement.frame)],
+                    )
+                    for sensor_label, radar_actor, measurement in batch
+                ]
+                for f in futures:
+                    try:
+                        f.result()
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"{RADAR_TEST_LOG_PREFIX} worker error: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
             if isinstance(radar_queue, PerRadarLatestBuffer):
                 break
 
     def make_callback(sensor_label: str, radar_actor):
         def radar_callback(measurement):
+            now = time.time()
+            with per_radar_lock:
+                st = per_radar_stats.setdefault(sensor_label, {
+                    "first_msg_at": now,
+                    "last_msg_at": now,
+                    "first_msg_frame": int(measurement.frame),
+                    "last_msg_frame": int(measurement.frame),
+                    "arrivals": 0,
+                })
+                st["last_msg_at"] = now
+                st["last_msg_frame"] = int(measurement.frame)
+                st["arrivals"] += 1
             item = (sensor_label, radar_actor, measurement)
             if isinstance(radar_queue, PerRadarLatestBuffer):
                 radar_queue.enqueue(sensor_label, item)
@@ -392,11 +461,61 @@ def run_test(
     last_status_line = ""
     autosave_busy = False
 
+    listen_attached_at = time.time()
+    first_world_frame = int(world.get_snapshot().frame)
+
     def publish_status(force: bool = False) -> None:
         nonlocal last_status_line
         snap = collector.snapshot()
         snap["queue_pending"] = radar_queue.pending()
         snap["queue_dropped"] = radar_queue.dropped
+        try:
+            ws = world.get_snapshot()
+            snap["world_frame"] = int(ws.frame)
+            snap["world_frames_since_attach"] = int(ws.frame) - first_world_frame
+            snap["wall_seconds_since_attach"] = round(time.time() - listen_attached_at, 3)
+        except Exception:  # noqa: BLE001
+            pass
+        with per_radar_lock:
+            snap["per_radar_arrivals"] = {
+                k: {"arrivals": v["arrivals"],
+                    "first_at": round(v["first_msg_at"] - listen_attached_at, 3),
+                    "last_at": round(v["last_msg_at"] - listen_attached_at, 3),
+                    "first_frame": v["first_msg_frame"],
+                    "last_frame": v["last_msg_frame"]}
+                for k, v in per_radar_stats.items()
+            }
+        # Mirror runtime telemetry into the collector so autosaves + final
+        # summary.json carry these fields too (not just live_stats.json).
+        telemetry = {
+            "queue_pending": snap.get("queue_pending"),
+            "queue_dropped": snap.get("queue_dropped"),
+            "queue_maxsize": getattr(radar_queue, "_queue", None).maxsize
+                if hasattr(radar_queue, "_queue") else None,
+            "queue_type": type(radar_queue).__name__,
+            "world_frame": snap.get("world_frame"),
+            "world_frames_since_attach": snap.get("world_frames_since_attach"),
+            "wall_seconds_since_attach": snap.get("wall_seconds_since_attach"),
+            "per_radar_arrivals": snap.get("per_radar_arrivals", {}),
+        }
+        total_enq = (telemetry["queue_dropped"] or 0) + (snap.get("radar_messages") or 0)
+        wall = telemetry["wall_seconds_since_attach"] or 0
+        wf = telemetry["world_frames_since_attach"] or 0
+        telemetry["enqueue_attempts_total"] = total_enq
+        telemetry["enqueue_retention_pct"] = (
+            round(100 * (snap.get("radar_messages") or 0) / total_enq, 3)
+            if total_enq > 0 else None
+        )
+        telemetry["world_fps_hz"] = round(wf / wall, 3) if wall > 0 else None
+        telemetry["arrival_hz_per_radar"] = (
+            round(total_enq / wall / max(1, len(per_radar_stats)), 3)
+            if wall > 0 and per_radar_stats else None
+        )
+        telemetry["worker_count"] = _worker_count
+        telemetry["drain_hz_total"] = (
+            round((snap.get("radar_messages") or 0) / wall, 3) if wall > 0 else None
+        )
+        collector.set_runtime_telemetry(telemetry)
         line = format_status_line(snap)
         if force or line != last_status_line:
             print(line, flush=True)
@@ -459,6 +578,15 @@ def run_test(
                 radar.stop()
             except RuntimeError:
                 pass
+        if label_executor is not None:
+            try:
+                label_executor.shutdown(wait=True, cancel_futures=False)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            publish_status(force=True)  # final snapshot with all instrumentation
+        except Exception:  # noqa: BLE001
+            pass
 
     return collector
 

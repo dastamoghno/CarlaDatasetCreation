@@ -112,6 +112,14 @@ class LabelingStatsCollector:
         self._failure_samples_seen = 0
         self.failure_samples: list[dict[str, Any]] = []
 
+        # Per-run telemetry set by the test loop (queue drops, per-radar arrival timing,
+        # world frame range). Mirrored into summary.json under "runtime".
+        self.runtime_telemetry: dict[str, Any] = {}
+
+    def set_runtime_telemetry(self, telemetry: dict[str, Any]) -> None:
+        with self.lock:
+            self.runtime_telemetry = dict(telemetry)
+
     def _depth_bin_index(self, depth_m: float) -> int | None:
         if depth_m < 0:
             return None
@@ -976,6 +984,8 @@ def write_report(
         snap.get("with_candidates", 0) >= 50
         and snap.get("match_rate_given_candidates", 0.0) >= min_match_rate
     )
+    with collector.lock:
+        runtime_snapshot = dict(collector.runtime_telemetry)
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "expected_radars": sorted(expected_radar_labels),
@@ -996,6 +1006,7 @@ def write_report(
             "single_candidate_max_margin_m": single_candidate_max_margin_m,
         },
         "summary": snap,
+        "runtime": runtime_snapshot,
         "co_visibility": dict(collector.co_visibility_hist),
         "busiest_frame": collector.busiest_frame_snapshot(),
         "files": {
