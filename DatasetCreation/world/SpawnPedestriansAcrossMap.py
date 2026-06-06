@@ -57,6 +57,43 @@ def pedestrian_count_from_env(default=DEFAULT_PED_COUNT) -> int:
         return default
 
 
+def ped_spawn_region_from_env():
+    """Return (center_x, center_y, radius_m) or None when unset.
+
+    When set, both initial navmesh spawn and AI retargeting reject samples
+    outside this 2D circle (z is ignored).
+    """
+    cx = os.environ.get("DATASET_PED_SPAWN_CENTER_X", "").strip()
+    cy = os.environ.get("DATASET_PED_SPAWN_CENTER_Y", "").strip()
+    rr = os.environ.get("DATASET_PED_SPAWN_RADIUS_M", "").strip()
+    if not (cx and cy and rr):
+        return None
+    try:
+        return (float(cx), float(cy), float(rr))
+    except ValueError:
+        return None
+
+
+_PED_REGION_MAX_NAV_ATTEMPTS = 200
+
+
+def get_nav_location_in_region(world, region):
+    """Rejection-sample navmesh points until one lands inside region (cx, cy, r_m)."""
+    if region is None:
+        return world.get_random_location_from_navigation()
+    cx, cy, r = region
+    r_sq = r * r
+    for _ in range(_PED_REGION_MAX_NAV_ATTEMPTS):
+        loc = world.get_random_location_from_navigation()
+        if loc is None:
+            continue
+        dx = loc.x - cx
+        dy = loc.y - cy
+        if dx * dx + dy * dy <= r_sq:
+            return loc
+    return None
+
+
 def prompt_pedestrian_count(default=DEFAULT_PED_COUNT):
     while True:
         try:
@@ -103,9 +140,16 @@ def spawn_pedestrians_with_ai(client, world, count):
         raise RuntimeError("controller.ai.walker blueprint not found.")
 
     # 1) Collect navmesh spawn points (only valid pedestrian locations).
+    region = ped_spawn_region_from_env()
+    if region is not None:
+        print(
+            f"[ped] restricting spawn to circle (cx={region[0]:.1f}, cy={region[1]:.1f}, "
+            f"r={region[2]:.1f} m)",
+            flush=True,
+        )
     spawn_points = []
     for _ in range(count):
-        loc = world.get_random_location_from_navigation()
+        loc = get_nav_location_in_region(world, region)
         if loc is not None:
             spawn_points.append(carla.Transform(loc))
 
@@ -188,7 +232,7 @@ def spawn_pedestrians_with_ai(client, world, count):
         controller = all_actors[i]
         walker = all_actors[i + 1]
         speed = float(paired_speeds[i // 2])
-        target = world.get_random_location_from_navigation()
+        target = get_nav_location_in_region(world, region)
         if target is None:
             continue
 
@@ -210,11 +254,12 @@ def spawn_pedestrians_with_ai(client, world, count):
 
 def retarget_controllers(world, controllers):
     """Send walkers to a new random navmesh point (sidewalk / crosswalk)."""
+    region = ped_spawn_region_from_env()
     for controller in controllers:
         try:
             if not controller.is_alive:
                 continue
-            target = world.get_random_location_from_navigation()
+            target = get_nav_location_in_region(world, region)
             if target is not None:
                 controller.go_to_location(target)
         except RuntimeError:

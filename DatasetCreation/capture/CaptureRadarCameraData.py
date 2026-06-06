@@ -61,14 +61,17 @@ RADAR_VEHICLE_PROXIMITY_M = RADAR_ACTOR_PROXIMITY_M
 # Inflate each actor OBB extent when computing margin (m per axis).
 BBOX_MATCH_EXTENT_INFLATION_M = 0.75
 # Max distance from hit to OBB surface for a primary match (m).
-# 3.0 was too tight for the dataset radar layout: at depths of 20-35 m the
-# return often lands on ground / poles 5-7 m off the vehicle bbox, so most
-# in-beam vehicles failed the second-stage check. 6.0 recovers them without
-# bleeding into adjacent actors at the cell sizes used (~30 m radar spacing).
+# Default 1.5 m: with the higher ray density (points_per_second up to 20000) the
+# loose 6.0 m threshold attributed too much ground/building clutter NEAR an actor
+# to that actor — only ~5% of "vehicle" returns actually sat on the body, the rest
+# were road hits within 6 m. At 1.5 m, ~79% of vehicle returns are truly on-body
+# (max margin 2 m via the single-candidate fallback) while still capturing the real
+# ray hits. Raise back toward 6.0 only for sparse-return captures (low pps) where
+# in-beam vehicles would otherwise miss the second-stage check.
 # Override via DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M (clamped 0.5–25 m).
-RADAR_HIT_MATCH_MAX_MARGIN_M = 6.0
+RADAR_HIT_MATCH_MAX_MARGIN_M = 1.5
 # Looser margin when exactly one actor is in the depth/azimuth gate.
-RADAR_SINGLE_CANDIDATE_MAX_MARGIN_M = 7.0
+RADAR_SINGLE_CANDIDATE_MAX_MARGIN_M = 2.0
 # Backward-compatible alias for reports / CLI (near-surface threshold, not extent inflation).
 RADAR_HIT_MATCH_MAX_DISTANCE_M = RADAR_HIT_MATCH_MAX_MARGIN_M
 # Min |radial velocity| (m/s) to score a return. Default 0 includes parked/stalled actors.

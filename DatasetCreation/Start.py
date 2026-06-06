@@ -534,12 +534,20 @@ def _estimate_capture_wait_s(dc_root: Path) -> float:
     Falls back to a generous fixed value if the file can't be found.
     """
     # Fixed overhead: drain queue (≤30s) + extrinsics export + actor-frames load.
-    OVERHEAD_S = 120.0
+    # actor_frames.jsonl can be 600 MB+ for a 2 min capture and parsing it into
+    # the in-memory dict takes 30-60 s on its own — bump the overhead so the
+    # in-process labeler isn't killed before it even starts iterating.
+    OVERHEAD_S = 240.0
     # Conservative labeling throughput observed in practice: ~3 000 rows/s.
     # Each radar CSV row is roughly 200 bytes → ~600 kB/s.
     BYTES_PER_SECOND = 600_000.0
     SAFETY_FACTOR = 1.5
-    MIN_WAIT_S = 300.0   # Never less than 5 min (covers small captures).
+    # Bumped from 300 → 900 because the original budget routinely guillotined
+    # the in-process offline labeler on captures with 1 M+ radar rows (which
+    # is the common case once you have 8 radars and 2 min of streaming).
+    # Forcing users to re-run capture/LabelRadarCapture by hand defeated the
+    # whole point of DATASET_LABEL_RADAR_AFTER_CAPTURE=1.
+    MIN_WAIT_S = 900.0   # 15 min — covers 1.5 M row captures with safety.
     MAX_WAIT_S = 7200.0  # Cap at 2 h to avoid hanging indefinitely.
 
     run_dir = _resolve_last_capture_dir(dc_root)
@@ -595,7 +603,9 @@ def main() -> None:
     child_env["DATASET_KEEP_PEDESTRIANS_RUNNING"] = "1"
     child_env["DATASET_KEEP_TRAFFIC_RUNNING"] = "1"
     child_env["DATASET_FREE_VEHICLE_DRIVING"] = "1"
-    child_env["DATASET_AUTOMATIC_TRAFFIC_LIGHTS"] = "0"
+    child_env["DATASET_AUTOMATIC_TRAFFIC_LIGHTS"] = os.environ.get(
+        "DATASET_AUTOMATIC_TRAFFIC_LIGHTS", "0"
+    )
     child_env["DATASET_TRAFFIC_LIGHT_GUI_AUTOCONNECT"] = "1"
     if test_mode:
         child_env["DATASET_KEEP_SENSORS_RUNNING"] = "1"

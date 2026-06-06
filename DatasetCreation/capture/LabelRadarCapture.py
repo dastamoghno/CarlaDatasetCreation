@@ -33,6 +33,7 @@ from capture.actor_frame_log import ActorFrameLogger
 from capture.CaptureRadarCameraData import (
     RADAR_HORIZONTAL_FOV_DEG,
     RADAR_MAX_RANGE_M,
+    actor_rcs_proxy_projected_area_m2,
     evaluate_radar_detection_label,
     labelable_min_speed_from_env,
     radar_hit_match_max_margin_m_from_env,
@@ -148,9 +149,10 @@ def label_radar_capture_dir(
                 missing_frames += 1
                 actors = []
 
+            sensor_transform = _transform_from_row(row)
             label = evaluate_radar_detection_label(
                 None,
-                _transform_from_row(row),
+                sensor_transform,
                 _detection_from_row(row),
                 actors,
                 range_m=RADAR_MAX_RANGE_M,
@@ -190,6 +192,9 @@ def label_radar_capture_dir(
                     row["matched_vehicle_type_id"] = label["actor_type_id"]
                     row["matched_vehicle_class"] = label["actor_class"]
                     row["matched_vehicle_distance_m"] = row["matched_actor_bbox_margin_m"]
+                row["rcs_proxy_m2"] = actor_rcs_proxy_projected_area_m2(
+                    label.get("actor_snapshot"), sensor_transform.location
+                )
 
             writer.writerow(row)
             rows_written += 1

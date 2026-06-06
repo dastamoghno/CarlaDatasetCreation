@@ -45,6 +45,11 @@ VEHICLE_SPEED_REDUCTION_PCT = 25.0
 LABEL_REFRESH_S = 0.25
 LABEL_DURATION_S = 120.0
 AUTOPILOT_MONITOR_INTERVAL_S = 2.0
+# Drive-in mode: role prefix to find dataset radars + clearance so cars never
+# spawn inside a radar's range (avoids "pop-in"). 35 m matches RADAR_MAX_RANGE_M
+# in CaptureRadarCameraData.py; +5 m safety margin.
+DATASET_RADAR_ROLE_PREFIX = "dataset_radar_"
+RADAR_SPAWN_CLEARANCE_M = 40.0
 
 
 def distance_sq(loc_a, loc_b):
@@ -98,6 +103,79 @@ def get_nearby_spawn_points(spawn_points, center_transform, radius_m):
     return nearby
 
 
+def get_radar_positions(world):
+    """World-XY locations of every dataset radar (empty if none spawned yet)."""
+    out = []
+    for actor in world.get_actors():
+        if actor.type_id != "sensor.other.radar":
+            continue
+        if not actor.attributes.get("role_name", "").startswith(DATASET_RADAR_ROLE_PREFIX):
+            continue
+        loc = actor.get_transform().location
+        out.append((loc.x, loc.y))
+    return out
+
+
+def get_drive_in_spawn_points(
+    world_map,
+    spawn_points,
+    center_transform,
+    *,
+    exclusion_radius_m,
+    outer_radius_m,
+    monitored_center=None,
+    radar_positions=None,
+    radar_clearance_m=0.0,
+):
+    """Spawn-outside, drive-in: pick spawn points OUTSIDE the monitored zone whose
+    forward lane path actually drives INTO it.
+
+    A candidate qualifies iff:
+      1. It sits in the annulus [exclusion_radius_m, outer_radius_m] from the
+         monitored centre — i.e. outside the area we observe but close enough to
+         reach it.
+      2. It is at least ``radar_clearance_m`` from EVERY radar — the exclusion
+         radius is measured from the monitored centre, but radars are spread along
+         the corridor, so a point 40 m from centre can still sit inside an end
+         radar's range and cause a car to "pop in" instead of driving in. This
+         gate removes that.
+      3. Its forward lane-follow path enters within exclusion_radius_m of the
+         monitored centre — i.e. the car will actually appear in the scene we care
+         about rather than driving away from it.
+
+    Returned farthest-first so cars enter from the approaches and stream through,
+    rather than popping up at the boundary.
+    """
+    center = monitored_center if monitored_center is not None else center_transform.location
+    excl_sq = exclusion_radius_m * exclusion_radius_m
+    outer_sq = outer_radius_m * outer_radius_m
+    radars = radar_positions or []
+    clear_sq = radar_clearance_m * radar_clearance_m
+
+    def clear_of_radars(loc):
+        if not radars or radar_clearance_m <= 0.0:
+            return True
+        return all((loc.x - rx) ** 2 + (loc.y - ry) ** 2 > clear_sq for rx, ry in radars)
+
+    annulus = [
+        tr for tr in spawn_points
+        if excl_sq <= distance_sq(tr.location, center) <= outer_sq
+        and clear_of_radars(tr.location)
+    ]
+    # Validate drive-in: forward lane path must pass through the monitored zone.
+    drive_in = []
+    for tr in annulus:
+        path = build_lane_follow_path(
+            world_map, tr, num_points=FREE_DRIVING_PATH_POINTS, step_m=LANE_PATH_STEP_M
+        )
+        enters = any(distance_sq(p, center) <= excl_sq for p in path)
+        if enters:
+            drive_in.append(tr)
+    # Farthest-first: long approaches stream in first.
+    drive_in.sort(key=lambda tr: -distance_sq(tr.location, center))
+    return drive_in
+
+
 def build_lane_follow_path(world_map, spawn_transform, num_points=LANE_PATH_POINTS, step_m=LANE_PATH_STEP_M):
     """Forward path along the driving lane (no TM set_route / RoadOption junction list)."""
     wp = world_map.get_waypoint(
@@ -117,6 +195,62 @@ def build_lane_follow_path(world_map, spawn_transform, num_points=LANE_PATH_POIN
             break
         current = nxt[0]
     return path
+
+
+def spawn_center_index_from_env(default=SPAWN_CENTER_INDEX) -> int:
+    raw = os.environ.get("DATASET_SPAWN_CENTER_INDEX", "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def spawn_radius_m_from_env(default=SPAWN_RADIUS_M) -> float:
+    raw = os.environ.get("DATASET_SPAWN_RADIUS_M", "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def target_car_count_from_env(default=TARGET_CAR_COUNT) -> int:
+    raw = os.environ.get("DATASET_TARGET_CAR_COUNT", "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def spawn_exclusion_radius_m_from_env(default=0.0) -> float:
+    """Inner 'monitored zone' radius (m). When > 0, NO cars spawn inside it; they
+    spawn in the annulus [exclusion, spawn_radius] and must drive in. 0 disables
+    (legacy fill-the-zone behaviour)."""
+    raw = os.environ.get("DATASET_SPAWN_EXCLUSION_RADIUS_M", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+def vehicle_speed_reduction_pct_from_env(default=VEHICLE_SPEED_REDUCTION_PCT) -> float:
+    """Override TM speed_difference (% slower than posted limit).
+
+    Negative values drive ABOVE the speed limit, e.g. -50 → 1.5× limit.
+    Default 25.0 = 25% slower; Town10HD default-limit 30 km/h → effective 22 km/h.
+    """
+    raw = os.environ.get("DATASET_VEHICLE_SPEED_REDUCTION_PCT", "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def safe_following_distance_m_from_env(default=SAFE_FOLLOWING_DISTANCE_M) -> float:
+    raw = os.environ.get("DATASET_SAFE_FOLLOWING_DISTANCE_M", "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
 
 
 def free_vehicle_driving_from_env() -> bool:
@@ -156,9 +290,9 @@ def apply_free_driving_policy(traffic_manager, actor, world_map=None, spawn_tran
 
     # Crash prevention: enforce a safe gap and cap speed.
     if hasattr(traffic_manager, "distance_to_leading_vehicle"):
-        traffic_manager.distance_to_leading_vehicle(actor, SAFE_FOLLOWING_DISTANCE_M)
+        traffic_manager.distance_to_leading_vehicle(actor, safe_following_distance_m_from_env())
     if hasattr(traffic_manager, "vehicle_percentage_speed_difference"):
-        traffic_manager.vehicle_percentage_speed_difference(actor, VEHICLE_SPEED_REDUCTION_PCT)
+        traffic_manager.vehicle_percentage_speed_difference(actor, vehicle_speed_reduction_pct_from_env())
 
     if world_map is not None and spawn_transform is not None and hasattr(traffic_manager, "set_path"):
         path = build_lane_follow_path(
@@ -191,9 +325,9 @@ def apply_straight_driving_policy(traffic_manager, actor, world_map, spawn_trans
 
     # Crash prevention: enforce a safe gap and cap speed.
     if hasattr(traffic_manager, "distance_to_leading_vehicle"):
-        traffic_manager.distance_to_leading_vehicle(actor, SAFE_FOLLOWING_DISTANCE_M)
+        traffic_manager.distance_to_leading_vehicle(actor, safe_following_distance_m_from_env())
     if hasattr(traffic_manager, "vehicle_percentage_speed_difference"):
-        traffic_manager.vehicle_percentage_speed_difference(actor, VEHICLE_SPEED_REDUCTION_PCT)
+        traffic_manager.vehicle_percentage_speed_difference(actor, vehicle_speed_reduction_pct_from_env())
 
     if hasattr(traffic_manager, "set_path"):
         path = build_lane_follow_path(world_map, spawn_transform)
@@ -265,6 +399,123 @@ def monitor_autopilot_until_interrupted(
         time.sleep(poll_s)
 
 
+def recirculate_traffic_until_interrupted(
+    traffic_manager_port,
+    spawned_ids,
+    center_index,
+    *,
+    poll_s=AUTOPILOT_MONITOR_INTERVAL_S,
+):
+    """Sustained flow: keep a fixed fleet cycling THROUGH the monitored zone.
+
+    A car that drifts past ``recycle_radius_m`` from the monitored centre (i.e. it
+    has driven out the far side and is wandering off) is destroyed and a fresh car
+    is spawned at a random drive-in point in the annulus. Because both the
+    destruction (beyond recycle radius) and the respawn (in the annulus, outside
+    the exclusion radius) happen OUTSIDE the monitored zone, the observed scene
+    only ever sees cars driving through — never popping in/out.
+
+    Net effect: a bounded fleet of N cars produces an unbounded stream of corridor
+    traversals over the whole capture.
+    """
+    client, world = get_world()
+    world_map = world.get_map()
+    traffic_manager = client.get_trafficmanager(traffic_manager_port)
+    vehicle_bps = get_vehicle_blueprints(world)
+
+    spawn_points = world_map.get_spawn_points()
+    center_location = spawn_points[center_index].location
+    exclusion_radius_m = spawn_exclusion_radius_m_from_env()
+    outer_radius_m = spawn_radius_m_from_env()
+    # Recycle a car once it is well past the spawn annulus (driven out the far side).
+    recycle_radius_m = outer_radius_m + 20.0
+    recycle_sq = recycle_radius_m * recycle_radius_m
+
+    drive_in_points = get_drive_in_spawn_points(
+        world_map,
+        spawn_points,
+        spawn_points[center_index],
+        exclusion_radius_m=exclusion_radius_m,
+        outer_radius_m=outer_radius_m,
+        radar_positions=get_radar_positions(world),
+        radar_clearance_m=RADAR_SPAWN_CLEARANCE_M,
+    )
+    if not drive_in_points:
+        print("Recirculation: no drive-in points; falling back to plain autopilot monitor.",
+              flush=True)
+        monitor_autopilot_until_interrupted(traffic_manager_port, spawned_ids, poll_s)
+        return
+
+    print(
+        f"Recirculation manager active: fleet={len(spawned_ids)} cars, "
+        f"recycle beyond {recycle_radius_m:.0f} m, respawn in annulus "
+        f"[{exclusion_radius_m:.0f}, {outer_radius_m:.0f}] m. Ctrl+C to stop.",
+        flush=True,
+    )
+
+    recycle_count = 0
+    while True:
+        for idx, actor_id in enumerate(list(spawned_ids)):
+            try:
+                actor = world.get_actor(actor_id)
+                needs_recycle = actor is None or not actor.is_alive
+                if not needs_recycle:
+                    loc = actor.get_location()
+                    if distance_sq(loc, center_location) > recycle_sq:
+                        needs_recycle = True
+                if not needs_recycle:
+                    # Keep autopilot + policy fresh.
+                    actor.set_autopilot(True, traffic_manager_port)
+                    if free_vehicle_driving_from_env():
+                        apply_free_driving_policy(traffic_manager, actor)
+                    continue
+
+                # Destroy the drifted/dead car.
+                if actor is not None and actor.is_alive:
+                    try:
+                        actor.destroy()
+                    except RuntimeError:
+                        pass
+
+                # Respawn at a random drive-in point (retry a few collisions).
+                new_actor = None
+                for transform in random.sample(drive_in_points, min(len(drive_in_points), 8)):
+                    bp = random.choice(vehicle_bps)
+                    if bp.has_attribute("color"):
+                        bp.set_attribute(
+                            "color",
+                            random.choice(bp.get_attribute("color").recommended_values),
+                        )
+                    new_actor = world.try_spawn_actor(bp, transform)
+                    if new_actor is not None:
+                        try:
+                            new_actor.set_autopilot(True, traffic_manager_port)
+                            if free_vehicle_driving_from_env():
+                                apply_free_driving_policy(
+                                    traffic_manager, new_actor, world_map, transform
+                                )
+                            else:
+                                apply_straight_driving_policy(
+                                    traffic_manager, new_actor, world_map, transform
+                                )
+                        except (RuntimeError, AttributeError):
+                            try:
+                                new_actor.destroy()
+                            except RuntimeError:
+                                pass
+                            new_actor = None
+                            continue
+                        break
+                if new_actor is not None:
+                    spawned_ids[idx] = new_actor.id
+                    recycle_count += 1
+                    if recycle_count % 10 == 0:
+                        print(f"  [recirculation] {recycle_count} cars recycled", flush=True)
+            except (RuntimeError, AttributeError):
+                continue
+        time.sleep(poll_s)
+
+
 def get_vehicle_blueprints(world):
     blueprints = world.get_blueprint_library().filter("vehicle.*")
     usable = []
@@ -307,20 +558,47 @@ def try_spawn_cars(
 
     center_transform = spawn_points[center_index]
 
-    # All spawn points within the capture radius, nearest-first.
-    candidate_points = get_nearby_spawn_points(spawn_points, center_transform, spawn_radius_m)
-    if not candidate_points:
-        raise RuntimeError(
-            f"No spawn points found within {spawn_radius_m:.0f} m of spawn index {center_index}. "
-            "Try increasing SPAWN_RADIUS_M."
+    exclusion_radius_m = spawn_exclusion_radius_m_from_env()
+    if exclusion_radius_m > 0.0:
+        # Spawn-outside, drive-in: no cars inside the monitored zone; they enter it.
+        radar_positions = get_radar_positions(world)
+        candidate_points = get_drive_in_spawn_points(
+            world_map,
+            spawn_points,
+            center_transform,
+            exclusion_radius_m=exclusion_radius_m,
+            outer_radius_m=spawn_radius_m,
+            radar_positions=radar_positions,
+            radar_clearance_m=RADAR_SPAWN_CLEARANCE_M,
         )
-
-    print(
-        f"Spawn zone: index={center_index} "
-        f"({center_transform.location.x:.1f}, {center_transform.location.y:.1f}), "
-        f"radius={spawn_radius_m:.0f} m, candidates={len(candidate_points)}",
-        flush=True,
-    )
+        if not candidate_points:
+            raise RuntimeError(
+                f"No drive-in spawn points found in annulus "
+                f"[{exclusion_radius_m:.0f}, {spawn_radius_m:.0f}] m of spawn index "
+                f"{center_index} whose lane path enters the monitored zone. "
+                "Widen SPAWN_RADIUS_M or lower SPAWN_EXCLUSION_RADIUS_M."
+            )
+        print(
+            f"Spawn mode: DRIVE-IN | monitored centre index={center_index} "
+            f"({center_transform.location.x:.1f}, {center_transform.location.y:.1f}) | "
+            f"spawn annulus [{exclusion_radius_m:.0f}, {spawn_radius_m:.0f}] m | "
+            f"drive-in candidates={len(candidate_points)}",
+            flush=True,
+        )
+    else:
+        # Legacy: all spawn points within the capture radius, nearest-first.
+        candidate_points = get_nearby_spawn_points(spawn_points, center_transform, spawn_radius_m)
+        if not candidate_points:
+            raise RuntimeError(
+                f"No spawn points found within {spawn_radius_m:.0f} m of spawn index {center_index}. "
+                "Try increasing SPAWN_RADIUS_M."
+            )
+        print(
+            f"Spawn zone: index={center_index} "
+            f"({center_transform.location.x:.1f}, {center_transform.location.y:.1f}), "
+            f"radius={spawn_radius_m:.0f} m, candidates={len(candidate_points)}",
+            flush=True,
+        )
 
     vehicle_bps = get_vehicle_blueprints(world)
     spawned_ids = []
@@ -414,16 +692,20 @@ def main():
         move_away_timeout_s,
         labeled_actors,
     ) = try_spawn_cars(
-        world, traffic_manager=client.get_trafficmanager(TRAFFIC_MANAGER_PORT)
+        world,
+        traffic_manager=client.get_trafficmanager(TRAFFIC_MANAGER_PORT),
+        center_index=spawn_center_index_from_env(),
+        spawn_radius_m=spawn_radius_m_from_env(),
+        target_count=target_car_count_from_env(),
     )
 
     print(f"Spawn point total on map: {spawn_point_total}")
     print(
-        f"Spawn center: index={SPAWN_CENTER_INDEX} "
+        f"Spawn center: index={spawn_center_index_from_env()} "
         f"({center_transform.location.x:.2f}, {center_transform.location.y:.2f}, "
         f"{center_transform.location.z:.2f})"
     )
-    print(f"Spawn radius: {SPAWN_RADIUS_M:.0f} m  |  candidates in radius: {candidate_count}")
+    print(f"Spawn radius: {spawn_radius_m_from_env():.0f} m  |  candidates in radius: {candidate_count}")
     print(
         f"Poisson spawn rate: {spawn_rate:.2f}/s "
         f"(mean interval {1.0 / spawn_rate:.2f}s)"
@@ -446,7 +728,7 @@ def main():
         f"Spawn gating: next spawn waits until previous moved "
         f">={move_away_distance_m:.1f} m (timeout {move_away_timeout_s:.1f}s)"
     )
-    print(f"Requested cars: {TARGET_CAR_COUNT}")
+    print(f"Requested cars: {target_car_count_from_env()}")
     print(f"Successfully spawned: {count}")
     if ids:
         print("Spawned vehicle actor IDs:", ", ".join(str(actor_id) for actor_id in ids))
@@ -465,7 +747,12 @@ def main():
                 flush=True,
             )
             try:
-                monitor_autopilot_until_interrupted(traffic_manager_port, ids)
+                if spawn_exclusion_radius_m_from_env() > 0.0:
+                    recirculate_traffic_until_interrupted(
+                        traffic_manager_port, ids, spawn_center_index_from_env()
+                    )
+                else:
+                    monitor_autopilot_until_interrupted(traffic_manager_port, ids)
             except KeyboardInterrupt:
                 print("Autopilot monitor stopped.")
         else:
