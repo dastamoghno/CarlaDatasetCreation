@@ -45,7 +45,11 @@ RADAR_HORIZONTAL_FOV_DEG = 120.0
 RADAR_VERTICAL_FOV_DEG = 60.0
 # CARLA default points_per_second is 1500; raise for denser returns (CPU cost scales up).
 # Very high values block the client callback thread and stall the sensor stream.
-RADAR_POINTS_PER_SECOND_DEFAULT = 3000
+# 15000 is the tuned corridor default: with VFOV=60° it gives ~55% per-tick vehicle
+# hit-rate and median ~14 detections/vehicle/frame (vs ~12% / 0.7 at 3000). CPU cost
+# is ~7 cores on the EPYC host — well within budget. Drop to 3000 for low-CPU runs;
+# CARLA hard-clamps the env override at 20000.
+RADAR_POINTS_PER_SECOND_DEFAULT = 15000
 # 0.0 = emit every simulation step (floods multi-radar setups); 0.05 ≈ 20 Hz per radar.
 RADAR_SENSOR_TICK_S = 0.05
 # Extra range beyond reported depth when building per-detection candidates.

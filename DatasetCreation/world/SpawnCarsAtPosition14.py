@@ -18,12 +18,14 @@ import carla
 from carla_connect import get_world
 
 
-# Primary spawn anchor: map spawn-point index 14 is the "Position 14" dataset zone.
-SPAWN_CENTER_INDEX = 14
-# Only vehicles within this radius of spawn point 14 are used.
-# Keeps all traffic local to the capture area and avoids random far-flung spawns.
-SPAWN_RADIUS_M = 200.0
-TARGET_CAR_COUNT = 35
+# Primary spawn anchor: map spawn-point index 144 is the monitored corridor
+# (road_id 10, ~(22.9, -60.9)) covered by the 8-radar layout. Index 14 was the
+# legacy "Position 14" zone (~(-113, -25)) — far from the radars; do not use it.
+SPAWN_CENTER_INDEX = 144
+# Only vehicles within this radius of the corridor anchor are used. 80 m keeps
+# traffic local enough to fill the corridor while giving cars room to drive.
+SPAWN_RADIUS_M = 80.0
+TARGET_CAR_COUNT = 30
 # Poisson process rate (lambda): expected spawns per second.
 SPAWN_RATE_PER_SECOND = 0.5
 TRAFFIC_MANAGER_PORT = 8000
@@ -37,10 +39,13 @@ LANE_PATH_POINTS = 120
 FREE_DRIVING_PATH_POINTS = 300
 LANE_PATH_STEP_M = 5.0
 # ── Crash-prevention settings ───────────────────────────────────────────────
-# Minimum gap (metres) the TM keeps behind the vehicle ahead.
-SAFE_FOLLOWING_DISTANCE_M = 8.0
-# Positive value → vehicles drive this % slower than the posted speed limit.
-VEHICLE_SPEED_REDUCTION_PCT = 25.0
+# Minimum gap (metres) the TM keeps behind the vehicle ahead. 3 m keeps the
+# corridor flowing without long pile-ups (Town10HD default-limit roads are slow).
+SAFE_FOLLOWING_DISTANCE_M = 3.0
+# Positive → drive this % slower than the limit; NEGATIVE → faster. -100 = 2x the
+# posted limit (~60 km/h on Town10HD's signless 30 km/h corridor) so vehicles show
+# real Doppler instead of crawling. Set positive for slow/dense traffic.
+VEHICLE_SPEED_REDUCTION_PCT = -100.0
 # ────────────────────────────────────────────────────────────────────────────
 LABEL_REFRESH_S = 0.25
 LABEL_DURATION_S = 120.0

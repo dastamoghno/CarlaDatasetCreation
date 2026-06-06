@@ -35,6 +35,13 @@ PED_RUNNING_FRACTION = 0.15
 PED_CROSSING_FACTOR = 0.35
 # Occasionally send a new nav target so pedestrians keep roaming the map.
 RETARGET_INTERVAL_S = 45.0
+# Default pedestrian spawn region: the monitored corridor (~(18.45, -63.0), 60 m).
+# Keeps walkers in/around the radar coverage instead of scattered map-wide.
+# Override via DATASET_PED_SPAWN_CENTER_X/Y + DATASET_PED_SPAWN_RADIUS_M; set the
+# radius env to a huge value (or edit here) to restore map-wide spawning.
+DEFAULT_PED_SPAWN_CENTER_X = 18.45
+DEFAULT_PED_SPAWN_CENTER_Y = -63.0
+DEFAULT_PED_SPAWN_RADIUS_M = 60.0
 
 
 def keep_pedestrians_running() -> bool:
@@ -58,20 +65,25 @@ def pedestrian_count_from_env(default=DEFAULT_PED_COUNT) -> int:
 
 
 def ped_spawn_region_from_env():
-    """Return (center_x, center_y, radius_m) or None when unset.
+    """Return (center_x, center_y, radius_m); defaults to the monitored corridor.
 
-    When set, both initial navmesh spawn and AI retargeting reject samples
-    outside this 2D circle (z is ignored).
+    Both initial navmesh spawn and AI retargeting reject samples outside this 2D
+    circle (z ignored). Each of the three values falls back to its corridor default
+    independently, so you can override just the radius (etc.) via env.
     """
-    cx = os.environ.get("DATASET_PED_SPAWN_CENTER_X", "").strip()
-    cy = os.environ.get("DATASET_PED_SPAWN_CENTER_Y", "").strip()
-    rr = os.environ.get("DATASET_PED_SPAWN_RADIUS_M", "").strip()
-    if not (cx and cy and rr):
-        return None
-    try:
-        return (float(cx), float(cy), float(rr))
-    except ValueError:
-        return None
+    def _f(name, default):
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+    return (
+        _f("DATASET_PED_SPAWN_CENTER_X", DEFAULT_PED_SPAWN_CENTER_X),
+        _f("DATASET_PED_SPAWN_CENTER_Y", DEFAULT_PED_SPAWN_CENTER_Y),
+        _f("DATASET_PED_SPAWN_RADIUS_M", DEFAULT_PED_SPAWN_RADIUS_M),
+    )
 
 
 _PED_REGION_MAX_NAV_ATTEMPTS = 200

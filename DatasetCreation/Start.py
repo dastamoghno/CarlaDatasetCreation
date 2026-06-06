@@ -603,8 +603,11 @@ def main() -> None:
     child_env["DATASET_KEEP_PEDESTRIANS_RUNNING"] = "1"
     child_env["DATASET_KEEP_TRAFFIC_RUNNING"] = "1"
     child_env["DATASET_FREE_VEHICLE_DRIVING"] = "1"
+    # Default "1": let CARLA cycle the lights so corridor traffic flows. "0" freezes
+    # a perimeter ring of lights RED to trap cars in the zone — that starves the
+    # corridor (vehicles queue at red and never reach the radars). Override per-run.
     child_env["DATASET_AUTOMATIC_TRAFFIC_LIGHTS"] = os.environ.get(
-        "DATASET_AUTOMATIC_TRAFFIC_LIGHTS", "0"
+        "DATASET_AUTOMATIC_TRAFFIC_LIGHTS", "1"
     )
     child_env["DATASET_TRAFFIC_LIGHT_GUI_AUTOCONNECT"] = "1"
     if test_mode:
