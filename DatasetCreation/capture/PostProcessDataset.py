@@ -156,56 +156,31 @@ def class_offsets_from_data(labeled_path, target_median_dbsm):
     return offsets, info
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--capture-dir", required=True, type=Path)
-    p.add_argument(
-        "--micro-doppler-sigma",
-        type=float,
-        default=DEFAULT_MICRO_DOPPLER_SIGMA,
-        help="Gaussian stddev (m/s) added to bulk pedestrian Doppler. "
-             "0 disables noise (option 1 only).",
-    )
-    p.add_argument(
-        "--fd-stride",
-        type=int,
-        default=DEFAULT_FD_STRIDE,
-        help="Central-difference stride in world ticks for walker velocity.",
-    )
-    p.add_argument(
-        "--max-walker-speed",
-        type=float,
-        default=DEFAULT_MAX_WALKER_SPEED_MPS,
-        help="Hard ceiling on bulk walker speed (m/s). Above this the value is "
-             "treated as a navmesh batch-update artifact and clamped.",
-    )
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument(
-        "--rcs-db-noise",
-        action="store_true",
-        default=True,
-        help="Add two-scale dB-domain noise (per-actor offset + per-frame jitter) "
-             "to rcs_dBsm so class distributions overlap realistically.",
-    )
-    p.add_argument(
-        "--no-rcs-db-noise",
-        dest="rcs_db_noise",
-        action="store_false",
-        help="Disable RCS dB noise (median-only calibration).",
-    )
-    p.add_argument("--out", type=Path, default=None,
-                   help="Output CSV path (defaults to overwriting the input).")
-    args = p.parse_args()
+def post_process_capture_dir(
+    capture_dir,
+    *,
+    micro_doppler_sigma=DEFAULT_MICRO_DOPPLER_SIGMA,
+    fd_stride=DEFAULT_FD_STRIDE,
+    max_walker_speed=DEFAULT_MAX_WALKER_SPEED_MPS,
+    seed=0,
+    rcs_db_noise_enabled=True,
+    out=None,
+):
+    """In-place pedestrian-Doppler + RCS-dBsm post-process for a capture dir.
 
-    capture_dir = args.capture_dir
+    Importable entry point (also invoked by CaptureRadarCameraData after capture
+    when DATASET_POSTPROCESS_AFTER_CAPTURE=1). Returns the output Path; raises
+    FileNotFoundError / RuntimeError on bad input.
+    """
+    capture_dir = Path(capture_dir)
     labeled = capture_dir / LABELED_CSV
     frames_path = capture_dir / ACTOR_FRAMES_JSONL
-    out = args.out or labeled
+    out = out or labeled
 
     if not labeled.is_file():
-        sys.exit(f"Missing {labeled}")
+        raise FileNotFoundError(f"Missing {labeled}")
     if not frames_path.is_file():
-        sys.exit(f"Missing {frames_path}")
+        raise FileNotFoundError(f"Missing {frames_path}")
 
     print(f"[1/4] Loading walker positions from {frames_path.name} ...", flush=True)
     walker_pos = load_walker_positions(frames_path)
@@ -220,7 +195,7 @@ def main():
     print(f"[3/4] Calibrating RCS dBsm offsets ...", flush=True)
     offsets, info = class_offsets_from_data(labeled, DEFAULT_TARGET_MEDIAN_DBSM)
     if not offsets:
-        sys.exit("No matched rows with rcs_proxy_m2 — nothing to calibrate.")
+        raise RuntimeError("No matched rows with rcs_proxy_m2 — nothing to calibrate.")
     for klass, (med_m2, cur_db, tgt_db, off, n) in info.items():
         print(f"      {klass:<12} n={n:>7,}  median(m²)={med_m2:.4f}  "
               f"current_dBsm={cur_db:+.2f}  target_dBsm={tgt_db:+.2f}  "
@@ -228,11 +203,11 @@ def main():
 
     print(f"[4/4] Rewriting {out.name} (in-place rewrite is atomic via .tmp swap) ...",
           flush=True)
-    if args.rcs_db_noise:
+    if rcs_db_noise_enabled:
         print(f"      RCS dB noise: per-actor offset + per-frame jitter "
               f"(targets pedestrian σ≈4, car σ≈3.2, truck σ≈3 dB)", flush=True)
-    rng = random.Random(args.seed)
-    fd = args.fd_stride
+    rng = random.Random(seed)
+    fd = fd_stride
 
     # Deterministic per-(class, actor) and per-(class, actor, frame) offsets.
     # Cached because the same actor and (actor, frame) appear in many rows;
@@ -248,13 +223,13 @@ def main():
         key_a = (klass, actor_id)
         ao = actor_offset_cache.get(key_a)
         if ao is None:
-            seed_a = f"{args.seed}|{klass}|{actor_id}|actor"
+            seed_a = f"{seed}|{klass}|{actor_id}|actor"
             ao = random.Random(seed_a).gauss(0.0, sa)
             actor_offset_cache[key_a] = ao
         key_f = (klass, actor_id, frame_id)
         fo = frame_offset_cache.get(key_f)
         if fo is None:
-            seed_f = f"{args.seed}|{klass}|{actor_id}|{frame_id}"
+            seed_f = f"{seed}|{klass}|{actor_id}|{frame_id}"
             fo = random.Random(seed_f).gauss(0.0, sf)
             frame_offset_cache[key_f] = fo
         return ao + fo
@@ -263,7 +238,7 @@ def main():
     stats_walker_skipped = 0
     stats_walker_clamped = 0
     stats_rcs_dbsm_written = 0
-    max_walker_speed = max(0.1, float(args.max_walker_speed))
+    max_walker_speed = max(0.1, float(max_walker_speed))
     tmp = out.with_suffix(out.suffix + ".tmp")
     with labeled.open(newline="", encoding="utf-8") as fin:
         reader = csv.DictReader(fin)
@@ -308,8 +283,8 @@ def main():
                             if n > 1e-6:
                                 ux /= n; uy /= n; uz /= n
                                 v_rad = vx * ux + vy * uy + vz * uz
-                                if args.micro_doppler_sigma > 0:
-                                    v_rad += rng.gauss(0.0, args.micro_doppler_sigma)
+                                if micro_doppler_sigma > 0:
+                                    v_rad += rng.gauss(0.0, micro_doppler_sigma)
                                 row["velocity_mps"] = f"{v_rad:.6f}"
                                 stats_walker_fixed += 1
                             else:
@@ -325,7 +300,7 @@ def main():
                         v = float(r)
                         if v > 0:
                             dbsm = 10.0 * math.log10(v) + offsets[klass]
-                            if args.rcs_db_noise and aid_raw:
+                            if rcs_db_noise_enabled and aid_raw:
                                 try:
                                     dbsm += rcs_db_noise(
                                         klass, int(aid_raw), int(row["frame"])
@@ -359,6 +334,62 @@ def main():
               f"(no clamps above {max_walker_speed:.1f} m/s).", flush=True)
     print(f"  rcs_dBsm cells written: {stats_rcs_dbsm_written:,}", flush=True)
     print(f"Done -> {out}", flush=True)
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--capture-dir", required=True, type=Path)
+    p.add_argument(
+        "--micro-doppler-sigma",
+        type=float,
+        default=DEFAULT_MICRO_DOPPLER_SIGMA,
+        help="Gaussian stddev (m/s) added to bulk pedestrian Doppler. "
+             "0 disables noise (option 1 only).",
+    )
+    p.add_argument(
+        "--fd-stride",
+        type=int,
+        default=DEFAULT_FD_STRIDE,
+        help="Central-difference stride in world ticks for walker velocity.",
+    )
+    p.add_argument(
+        "--max-walker-speed",
+        type=float,
+        default=DEFAULT_MAX_WALKER_SPEED_MPS,
+        help="Hard ceiling on bulk walker speed (m/s). Above this the value is "
+             "treated as a navmesh batch-update artifact and clamped.",
+    )
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--rcs-db-noise",
+        action="store_true",
+        default=True,
+        help="Add two-scale dB-domain noise (per-actor offset + per-frame jitter) "
+             "to rcs_dBsm so class distributions overlap realistically.",
+    )
+    p.add_argument(
+        "--no-rcs-db-noise",
+        dest="rcs_db_noise",
+        action="store_false",
+        help="Disable RCS dB noise (median-only calibration).",
+    )
+    p.add_argument("--out", type=Path, default=None,
+                   help="Output CSV path (defaults to overwriting the input).")
+    args = p.parse_args()
+
+    try:
+        post_process_capture_dir(
+            args.capture_dir,
+            micro_doppler_sigma=args.micro_doppler_sigma,
+            fd_stride=args.fd_stride,
+            max_walker_speed=args.max_walker_speed,
+            seed=args.seed,
+            rcs_db_noise_enabled=args.rcs_db_noise,
+            out=args.out,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":

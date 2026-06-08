@@ -10,8 +10,11 @@ _dc_entry.bootstrap(__file__)
 
 import csv
 import datetime
+import json
 import math
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -65,17 +68,22 @@ RADAR_VEHICLE_PROXIMITY_M = RADAR_ACTOR_PROXIMITY_M
 # Inflate each actor OBB extent when computing margin (m per axis).
 BBOX_MATCH_EXTENT_INFLATION_M = 0.75
 # Max distance from hit to OBB surface for a primary match (m).
-# Default 1.5 m: with the higher ray density (points_per_second up to 20000) the
-# loose 6.0 m threshold attributed too much ground/building clutter NEAR an actor
-# to that actor — only ~5% of "vehicle" returns actually sat on the body, the rest
-# were road hits within 6 m. At 1.5 m, ~79% of vehicle returns are truly on-body
-# (max margin 2 m via the single-candidate fallback) while still capturing the real
-# ray hits. Raise back toward 6.0 only for sparse-return captures (low pps) where
-# in-beam vehicles would otherwise miss the second-stage check.
-# Override via DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M (clamped 0.5–25 m).
-RADAR_HIT_MATCH_MAX_MARGIN_M = 1.5
+# Default 0.5 m: derived from the uncensored nearest-margin distribution of a real
+# capture (tools/derive_match_threshold_uncensored.py). Genuine ray hits land ON
+# the actor OBB, so they pile into a spike at margin ~0 (here ~12% of candidate
+# returns, all within the 0.75 m inflation). Past a trough at ~0.2 m the histogram
+# is a monotonically RISING road/structure-clutter ramp with no second lobe and no
+# valley — i.e. raising the threshold buys ~zero extra on-body returns and only
+# admits clutter. Precision (on-body / accepted) on that capture: 0.5 m -> 87%,
+# 1.5 m -> 53%, 2.0 m -> 42%. 0.5 m keeps a little slack for bbox-underfit / pose
+# jitter; drop toward 0.25 m for max precision (~96%). The trough shifts with pps,
+# so re-derive per capture: the QA report (radar_labeling_summary.png) now plots the
+# spike/trough/precision curve, or set DATASET_RADAR_AUTO_MARGIN=1 to derive+apply it
+# automatically. Override the constant via DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M
+# (clamped 0.5–25 m).
+RADAR_HIT_MATCH_MAX_MARGIN_M = 0.5
 # Looser margin when exactly one actor is in the depth/azimuth gate.
-RADAR_SINGLE_CANDIDATE_MAX_MARGIN_M = 2.0
+RADAR_SINGLE_CANDIDATE_MAX_MARGIN_M = 1.0
 # Backward-compatible alias for reports / CLI (near-surface threshold, not extent inflation).
 RADAR_HIT_MATCH_MAX_DISTANCE_M = RADAR_HIT_MATCH_MAX_MARGIN_M
 # Min |radial velocity| (m/s) to score a return. Default 0 includes parked/stalled actors.
@@ -89,7 +97,7 @@ DATASET_CAMERA_ROLE_PREFIX = "dataset_camera_"
 
 
 def _expected_radar_count_from_env() -> int:
-    raw = os.environ.get("DATASET_EXPECTED_RADAR_COUNT", "12")
+    raw = os.environ.get("DATASET_EXPECTED_RADAR_COUNT", "8")
     try:
         n = int(raw)
     except ValueError:
@@ -1540,12 +1548,16 @@ def evaluate_radar_detection_label(
     actor_snapshot = None
     match_bbox_margin_m = None
     nearest_bbox_margin_m = None
+    # Nearest-OBB margin BEFORE matching — survives the matched-row overwrite below
+    # so the QA report can plot the true (threshold-independent) margin distribution.
+    uncensored_nearest_bbox_margin_m = None
 
     if had_candidates:
         hit_loc = radar_detection_world_location(sensor_transform, detection)
-        nearest_bbox_margin_m = nearest_actor_bbox_margin_m(
+        uncensored_nearest_bbox_margin_m = nearest_actor_bbox_margin_m(
             hit_loc, match_candidates, world
         )
+        nearest_bbox_margin_m = uncensored_nearest_bbox_margin_m
         ma, margin = match_radar_detection_to_actor(
             sensor_transform,
             detection,
@@ -1583,6 +1595,7 @@ def evaluate_radar_detection_label(
         "actor_snapshot": actor_snapshot,
         "match_bbox_margin_m": match_bbox_margin_m,
         "nearest_bbox_margin_m": nearest_bbox_margin_m,
+        "uncensored_nearest_bbox_margin_m": uncensored_nearest_bbox_margin_m,
         "velocity_mps": velocity_mps,
     }
 
@@ -1600,6 +1613,108 @@ def labelable_min_speed_from_env() -> float:
 def label_after_capture_from_env() -> bool:
     raw = os.environ.get("DATASET_LABEL_RADAR_AFTER_CAPTURE", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+def postprocess_after_capture_from_env() -> bool:
+    """Auto-run PostProcessDataset (ped Doppler fix + rcs_dBsm) after labeling.
+
+    Default on: without it pedestrian Doppler stays 0 and rcs_dBsm is missing,
+    which is the wrong feature set for training and inflates shortcut probes.
+    """
+    raw = os.environ.get("DATASET_POSTPROCESS_AFTER_CAPTURE", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def postprocess_seed_from_env() -> int:
+    """Seed for PostProcessDataset's RCS/micro-Doppler noise (recorded in run_meta)."""
+    raw = os.environ.get("DATASET_POSTPROCESS_SEED", os.environ.get("DATASET_SEED", "0")).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def capture_duration_s_from_env() -> float | None:
+    """Auto-stop recording after N seconds (wall clock). None = run until Enter.
+
+    Lets the campaign orchestrator run fixed-length unattended captures via
+    DATASET_CAPTURE_DURATION_S. Values <= 0 are treated as unlimited.
+    """
+    raw = os.environ.get("DATASET_CAPTURE_DURATION_S", "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if val > 0 else None
+
+
+def _git_commit() -> str:
+    """Short git commit of the working tree (best-effort; '' if unavailable)."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def write_run_meta(run_dir, world, *, radar_count, camera_count, phase="start", extra=None):
+    """Write/refresh run_meta.json — the single source of truth for a capture.
+
+    Records the map, sensor counts, master seed, every DATASET_* env var actually
+    set, git commit, and timestamps. This is what makes leakage-free actor/site-level
+    train/eval splits and exact reruns possible. Called once at start and again at
+    stop (phase='stop') to stamp the end time. Best-effort: never raises.
+    """
+    try:
+        meta_path = Path(os.path.normpath(run_dir)) / "run_meta.json"
+        dataset_env = {
+            k: v for k, v in sorted(os.environ.items())
+            if k.startswith("DATASET_") or k in ("AUTOPILOT", "MAP")
+        }
+        try:
+            map_name = world.get_map().name
+        except Exception:  # noqa: BLE001
+            map_name = ""
+        meta = {
+            "phase": phase,
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "run_dir": os.path.normpath(run_dir),
+            "map": map_name,
+            "radar_count": radar_count,
+            "camera_count": camera_count,
+            "seed": os.environ.get("DATASET_SEED", ""),
+            "site_id": os.environ.get("DATASET_SITE_ID", ""),
+            "rig_pose": {
+                "anchor_x": os.environ.get("DATASET_RIG_ANCHOR_X", ""),
+                "anchor_y": os.environ.get("DATASET_RIG_ANCHOR_Y", ""),
+                "height_m": os.environ.get("DATASET_RIG_HEIGHT_M", ""),
+                "yaw_deg": os.environ.get("DATASET_RIG_YAW_DEG", ""),
+                "pitch_deg": os.environ.get("DATASET_RADAR_PITCH_DEG", ""),
+            },
+            "postprocess_seed": postprocess_seed_from_env(),
+            "git_commit": _git_commit(),
+            "dataset_env": dataset_env,
+        }
+        if extra:
+            meta.update(extra)
+        # Merge start fields if we're stamping the stop phase over an existing file.
+        if phase != "start" and meta_path.is_file():
+            try:
+                prior = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta = {**prior, **meta, "started_at": prior.get("timestamp", "")}
+            except Exception:  # noqa: BLE001
+                pass
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: could not write run_meta.json: {exc}", file=sys.stderr)
 
 
 def write_capture_labeling_report(
@@ -1772,6 +1887,9 @@ def process_radar_measurement_for_capture(
                     actor_class=label["actor_class"],
                     match_bbox_margin_m=label["match_bbox_margin_m"],
                     nearest_bbox_margin_m=label["nearest_bbox_margin_m"],
+                    uncensored_nearest_bbox_margin_m=label[
+                        "uncensored_nearest_bbox_margin_m"
+                    ],
                 )
             )
 
@@ -1849,7 +1967,30 @@ def process_radar_measurement_fast(
         counts["radar_scored"] += len(rows)
 
 
+def _install_stop_signal_handlers():
+    """Force SIGINT and SIGTERM to raise KeyboardInterrupt so this capture always
+    stops gracefully (drain → extrinsics → offline labeling in main()'s finally).
+
+    Critical for background launches: when Start.py is started in a backgrounded
+    shell pipeline, bash sets SIGINT to SIG_IGN and that disposition is INHERITED by
+    this child. Without re-installing a handler, Start.py's ``send_signal(SIGINT)``
+    (and any ``kill -INT``) is silently ignored, the capture records forever, and
+    Start.py blocks in ``capture_proc.wait()`` — the recurring teardown hang. We also
+    map SIGTERM to the same path so a plain ``kill`` stops us cleanly too."""
+    def _raise_kbd(signum, frame):
+        raise KeyboardInterrupt
+    # default_int_handler is CPython's built-in that raises KeyboardInterrupt; setting
+    # it explicitly overrides any inherited SIG_IGN.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        signal.signal(signal.SIGTERM, _raise_kbd)
+    except (ValueError, OSError):
+        # Not in the main thread (shouldn't happen for __main__) — skip rather than crash.
+        pass
+
+
 def main():
+    _install_stop_signal_handlers()
     client, world = get_world()
 
     print(f"Waiting up to {SENSOR_WAIT_TIMEOUT_S:.1f}s for tagged radar/camera sensors...")
@@ -1873,6 +2014,14 @@ def main():
             pointer_f.write(os.path.normpath(run_dir) + "\n")
     except OSError as e:
         print(f"Warning: could not write {pointer_path}: {e}", file=sys.stderr)
+
+    write_run_meta(
+        run_dir,
+        world,
+        radar_count=len(radar_sensors),
+        camera_count=len(camera_sensors),
+        phase="start",
+    )
 
     radar_file, radar_writer = setup_radar_writer(radar_csv)
     camera_file, camera_writer = setup_camera_writer(camera_csv)
@@ -2254,7 +2403,15 @@ def main():
             camera.listen(camera_callback)
 
         print("Listening to sensors...")
-        print("Press Enter to stop recording.")
+        capture_duration_s = capture_duration_s_from_env()
+        if capture_duration_s is not None:
+            capture_deadline = time.monotonic() + capture_duration_s
+            print(
+                f"Auto-stop after {capture_duration_s:.0f}s (or press Enter to stop early)."
+            )
+        else:
+            capture_deadline = None
+            print("Press Enter to stop recording.")
 
         last_print = time.time()
         while True:
@@ -2278,6 +2435,12 @@ def main():
                 drained_any = True
             radar_watchdog_check()
             if enter_pressed():
+                break
+            if capture_deadline is not None and time.monotonic() >= capture_deadline:
+                print(
+                    f"Auto-stop: reached {capture_duration_s:.0f}s capture duration.",
+                    flush=True,
+                )
                 break
 
             now = time.time()
@@ -2407,12 +2570,33 @@ def main():
             except Exception as exc:  # noqa: BLE001
                 print(f"Offline radar labeling failed: {exc}", file=sys.stderr, flush=True)
                 traceback.print_exc()
+            else:
+                if postprocess_after_capture_from_env():
+                    try:
+                        from capture.PostProcessDataset import post_process_capture_dir
+
+                        post_process_capture_dir(run_dir, seed=postprocess_seed_from_env())
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"Post-processing (Doppler/RCS) failed: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        traceback.print_exc()
         elif not capture_fast:
             write_capture_labeling_report(
                 labeling_collector,
                 run_dir,
                 labelable_min_speed_mps=labelable_min_speed_mps,
             )
+
+        write_run_meta(
+            run_dir,
+            world,
+            radar_count=len(radar_sensors),
+            camera_count=len(camera_sensors),
+            phase="stop",
+        )
 
         print("Recording stopped.")
         print(f"Radar file: {radar_csv}")

@@ -25,6 +25,92 @@ SCATTER_RESERVOIR_MAX = 8000
 FAILURE_SAMPLE_MAX = 5000
 BUSIEST_FRAME_POINT_CAP = 25000
 
+# Uncensored nearest-OBB-margin histogram (hit -> nearest candidate actor surface,
+# 0.75 m inflation already applied). Bounded by the 7 m candidate pre-filter.
+MARGIN_BIN_M = 0.05
+MARGIN_MAX_M = 7.0
+MARGIN_N_BINS = int(round(MARGIN_MAX_M / MARGIN_BIN_M))
+# Env clamp shared with DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M.
+MARGIN_FLOOR_M = 0.5
+MARGIN_CEIL_M = 25.0
+
+
+def margin_bin_centers() -> np.ndarray:
+    edges = np.arange(0.0, MARGIN_MAX_M + MARGIN_BIN_M, MARGIN_BIN_M)
+    return edges[:-1] + MARGIN_BIN_M / 2.0
+
+
+def margin_bin_index(margin_m: float | None) -> int | None:
+    if margin_m is None or margin_m < 0:
+        return None
+    return min(int(margin_m / MARGIN_BIN_M), MARGIN_N_BINS - 1)
+
+
+def derive_margin_threshold(
+    hist,
+    *,
+    spike_edge_m: float = 0.15,
+    trough_lo_m: float = 0.10,
+    trough_hi_m: float = 1.0,
+    min_samples: int = 2000,
+    floor_m: float = MARGIN_FLOOR_M,
+    ceil_m: float = MARGIN_CEIL_M,
+) -> dict[str, Any]:
+    """Derive a grounded match margin from an uncensored nearest-margin histogram.
+
+    Genuine ray hits land ON the actor OBB -> a spike at margin ~0; clutter that
+    merely shares the beam forms a monotonically rising ramp with no far lobe. The
+    only natural cut is the trough just past the spike. Returns spike/trough stats,
+    a precision (= spike / accepted) table, and suggested primary + single-candidate
+    margins (trough, floored at floor_m, so the value only moves UP for captures
+    whose clutter encroaches closer — e.g. sparse pps / high speed).
+    """
+    hist = np.asarray(hist, dtype=np.float64)
+    centers = margin_bin_centers()
+    total = float(hist.sum())
+    out: dict[str, Any] = {
+        "samples": int(total),
+        "enough_data": total >= min_samples,
+        "spike_edge_m": spike_edge_m,
+        "spike_count": 0,
+        "spike_frac": 0.0,
+        "trough_m": None,
+        "trough_count": None,
+        "suggested_primary_m": None,
+        "suggested_single_m": None,
+        "precision_table": [],
+    }
+    if total <= 0:
+        return out
+
+    spike = float(hist[centers < spike_edge_m].sum())
+    out["spike_count"] = int(spike)
+    out["spike_frac"] = spike / total
+
+    cum = np.cumsum(hist)
+
+    def accepted_le(thresh: float) -> float:
+        k = int(np.searchsorted(centers, thresh, side="right"))
+        return float(cum[k - 1]) if k > 0 else 0.0
+
+    out["precision_table"] = [
+        [float(t), int(accepted_le(t)), (spike / accepted_le(t)) if accepted_le(t) > 0 else 0.0]
+        for t in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+    ]
+
+    win = (centers >= trough_lo_m) & (centers < trough_hi_m)
+    idxs = np.where(win)[0]
+    if idxs.size and out["enough_data"]:
+        smooth = np.convolve(hist, np.ones(3) / 3.0, mode="same")
+        ti = int(idxs[int(np.argmin(smooth[idxs]))])
+        trough = float(centers[ti])
+        out["trough_m"] = round(trough, 3)
+        out["trough_count"] = int(hist[ti])
+        primary = min(max(trough, floor_m), ceil_m)
+        out["suggested_primary_m"] = round(primary, 2)
+        out["suggested_single_m"] = round(min(max(primary * 2.0, floor_m), ceil_m), 2)
+    return out
+
 
 @dataclass
 class BusiestFramePoint:
@@ -52,6 +138,8 @@ class DetectionRecord:
     actor_class: str = ""
     match_bbox_margin_m: float | None = None
     nearest_bbox_margin_m: float | None = None
+    # Threshold-independent nearest margin (pre-match), for the margin-distribution panel.
+    uncensored_nearest_bbox_margin_m: float | None = None
 
 
 class LabelingStatsCollector:
@@ -85,9 +173,14 @@ class LabelingStatsCollector:
         self.points_by_actor_class: Counter[str] = Counter()
         self.points_by_vehicle_class: Counter[str] = Counter()
         self.points_by_sensor: Counter[str] = Counter()
+        self.matched_vehicle_by_sensor: Counter[str] = Counter()
+        self.matched_pedestrian_by_sensor: Counter[str] = Counter()
         self.vehicle_sensor_matrix: Counter[tuple[int, str]] = Counter()
         self.depth_hist_matched = np.zeros(len(DEPTH_BIN_EDGES) - 1, dtype=np.int64)
         self.depth_hist_unmatched = np.zeros(len(DEPTH_BIN_EDGES) - 1, dtype=np.int64)
+        # Uncensored nearest-OBB margin over all returns that had a candidate.
+        self.margin_hist = np.zeros(MARGIN_N_BINS, dtype=np.int64)
+        self.margin_samples = 0
         self.velocity_samples_matched: list[float] = []
         self.velocity_samples_unmatched: list[float] = []
         self._velocity_cap = 12000
@@ -204,6 +297,10 @@ class LabelingStatsCollector:
                 bucket["matched"] += 1
                 category = "matched"
                 hist = self.depth_hist_matched
+                if rec.actor_kind == "pedestrian":
+                    self.matched_pedestrian_by_sensor[sl] += 1
+                else:
+                    self.matched_vehicle_by_sensor[sl] += 1
                 aid = rec.actor_id
                 if aid is not None:
                     if rec.actor_kind == "pedestrian":
@@ -232,6 +329,12 @@ class LabelingStatsCollector:
                 idx = self._depth_bin_index(rec.depth_m)
                 if idx is not None:
                     hist[idx] += 1
+
+            if rec.had_candidates:
+                mbi = margin_bin_index(rec.uncensored_nearest_bbox_margin_m)
+                if mbi is not None:
+                    self.margin_hist[mbi] += 1
+                    self.margin_samples += 1
 
             if category != "no_candidates":
                 self._maybe_add_scatter(rec.depth_m, rec.azimuth_rad, sl, category)
@@ -340,6 +443,12 @@ class LabelingStatsCollector:
                 if sensors:
                     self.co_visibility_hist[len(sensors)] += 1
 
+    def margin_threshold_diagnostics(self) -> dict[str, Any]:
+        """Spike/trough/precision stats + suggested margins from the uncensored hist."""
+        with self.lock:
+            hist = self.margin_hist.copy()
+        return derive_margin_threshold(hist)
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             total = self.total_detections
@@ -364,6 +473,43 @@ class LabelingStatsCollector:
                     "with_candidates": wc,
                     "match_rate_given_candidates": (m / wc) if wc else 0.0,
                 }
+
+            # Point density per radar per frame. radar_frames = distinct (sensor,frame)
+            # sweeps; each density = point count / radar_frames.
+            radar_frames = sum(len(s) for s in self._frame_sensors.values())
+            per_sensor_frames: Counter[str] = Counter()
+            for sensors in self._frame_sensors.values():
+                for s in sensors:
+                    per_sensor_frames[s] += 1
+            veh_pts = int(sum(self.points_by_vehicle.values()))
+            ped_pts = int(sum(self.points_by_pedestrian.values()))
+
+            def _pd(x: float) -> float:
+                return round(x / radar_frames, 4) if radar_frames else 0.0
+
+            density_by_sensor = {}
+            for label in sorted(self.by_sensor):
+                nf = per_sensor_frames.get(label, 0)
+                density_by_sensor[label] = {
+                    "frames": nf,
+                    "all": round(self.points_by_sensor.get(label, 0) / nf, 3) if nf else 0.0,
+                    "matched": round(self.by_sensor[label].get("matched", 0) / nf, 4) if nf else 0.0,
+                    "vehicle": round(self.matched_vehicle_by_sensor.get(label, 0) / nf, 4) if nf else 0.0,
+                    "pedestrian": round(self.matched_pedestrian_by_sensor.get(label, 0) / nf, 4) if nf else 0.0,
+                }
+            density_per_radar_per_frame = {
+                "radar_frames": radar_frames,
+                "all": _pd(total),
+                "matched": _pd(matched),
+                "vehicle": _pd(veh_pts),
+                "pedestrian": _pd(ped_pts),
+                "clutter_unmatched": _pd(total - matched),
+                "by_vehicle_class": {
+                    c: _pd(n) for c, n in sorted(self.points_by_vehicle_class.items())
+                },
+                "by_sensor": density_by_sensor,
+                "note": "points per radar per frame; radar_frames = distinct (sensor,frame) sweeps",
+            }
             return {
                 "total_detections": total,
                 "labelable_detections": total,
@@ -384,6 +530,7 @@ class LabelingStatsCollector:
                     else 0.0
                 ),
                 "by_sensor": by_sensor_out,
+                "density_per_radar_per_frame": density_per_radar_per_frame,
                 "legacy_matched": self.legacy_matched,
                 "legacy_failed": self.legacy_failed,
                 "unique_actors_matched": unique_vehicles + unique_pedestrians,
@@ -393,6 +540,9 @@ class LabelingStatsCollector:
                 if sensors_per_vehicle
                 else 0.0,
                 "max_radars_per_vehicle": max(sensors_per_vehicle) if sensors_per_vehicle else 0,
+                # derive_margin_threshold reads the array only (no lock) — safe under self.lock.
+                "margin_samples": int(self.margin_samples),
+                "margin_threshold": derive_margin_threshold(self.margin_hist),
             }
 
 
@@ -859,6 +1009,139 @@ def _plot_velocity(ax, collector: LabelingStatsCollector) -> None:
     ax.legend(fontsize=8)
 
 
+def _precision_at(hist: np.ndarray, centers: np.ndarray, spike: float, thresh: float) -> float:
+    k = int(np.searchsorted(centers, thresh, side="right"))
+    accepted = float(np.cumsum(hist)[k - 1]) if k > 0 else 0.0
+    return (spike / accepted) if accepted > 0 else 0.0
+
+
+def _plot_margin_hist(
+    ax,
+    collector: LabelingStatsCollector,
+    diag: dict[str, Any],
+    *,
+    current_primary: float | None,
+    current_single: float | None,
+    x_max: float = 4.0,
+) -> None:
+    with collector.lock:
+        hist = collector.margin_hist.copy()
+    centers = margin_bin_centers()
+    if hist.sum() <= 0:
+        ax.text(0.5, 0.5, "No candidate returns", ha="center", va="center")
+        ax.set_title("Hit→OBB margin distribution")
+        return
+    keep = centers <= x_max
+    ax.bar(centers[keep], hist[keep], width=MARGIN_BIN_M, color="#34495e", align="center")
+    ax.set_yscale("log")
+    ax.set_xlim(0, x_max)
+    ax.set_xlabel("Nearest-OBB margin (m)  [0.75 m inflation applied]")
+    ax.set_ylabel("Returns (log)")
+    ax.set_title(f"Hit→OBB margin (uncensored, n={int(hist.sum()):,}, 7 m cap)")
+
+    def vline(x, color, label):
+        if x is not None and 0 <= x <= x_max:
+            ax.axvline(x, color=color, ls="--", lw=1.4, label=label)
+
+    vline(diag.get("spike_edge_m"), "#7f8c8d", f"spike <{diag.get('spike_edge_m')} m")
+    vline(diag.get("trough_m"), "#27ae60", f"trough {diag.get('trough_m')} m")
+    vline(current_primary, "#e74c3c", f"current primary {current_primary} m")
+    sug = diag.get("suggested_primary_m")
+    if sug is not None and sug != current_primary:
+        vline(sug, "#2980b9", f"suggested {sug} m")
+    ax.legend(fontsize=7, loc="upper right")
+
+
+def _plot_margin_precision(
+    ax,
+    collector: LabelingStatsCollector,
+    diag: dict[str, Any],
+    *,
+    current_primary: float | None,
+    x_max: float = 3.0,
+) -> None:
+    with collector.lock:
+        hist = collector.margin_hist.copy()
+    centers = margin_bin_centers()
+    total = float(hist.sum())
+    if total <= 0:
+        ax.text(0.5, 0.5, "No candidate returns", ha="center", va="center")
+        ax.set_title("On-body precision vs threshold")
+        return
+    spike = float(diag.get("spike_count") or 0.0)
+    cum = np.cumsum(hist)
+    keep = centers <= x_max
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(cum > 0, spike / cum, 0.0)
+    ax.plot(centers[keep], 100.0 * precision[keep], color="#2980b9", lw=2, label="precision (on-body)")
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Match threshold T (m)")
+    ax.set_ylabel("On-body precision = spike / accepted (%)")
+    ax.set_title("Precision vs match threshold")
+    if current_primary is not None and 0 <= current_primary <= x_max:
+        p = 100.0 * _precision_at(hist, centers, spike, current_primary)
+        ax.axvline(current_primary, color="#e74c3c", ls="--", lw=1.4)
+        ax.annotate(f"current {current_primary} m\n{p:.0f}%", (current_primary, p),
+                    textcoords="offset points", xytext=(6, -4), fontsize=8, color="#e74c3c")
+    sug = diag.get("suggested_primary_m")
+    if sug is not None and 0 <= sug <= x_max and sug != current_primary:
+        p = 100.0 * _precision_at(hist, centers, spike, sug)
+        ax.axvline(sug, color="#27ae60", ls="--", lw=1.4)
+        ax.annotate(f"suggested {sug} m\n{p:.0f}%", (sug, p),
+                    textcoords="offset points", xytext=(6, 8), fontsize=8, color="#27ae60")
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_margin_text(
+    ax,
+    collector: LabelingStatsCollector,
+    diag: dict[str, Any],
+    *,
+    current_primary: float | None,
+    current_single: float | None,
+) -> None:
+    ax.axis("off")
+    with collector.lock:
+        hist = collector.margin_hist.copy()
+    centers = margin_bin_centers()
+    spike = float(diag.get("spike_count") or 0.0)
+    lines = ["Match-margin calibration", "(uncensored hit→nearest-OBB margin)", ""]
+    if not diag.get("enough_data"):
+        lines.append(f"samples: {diag.get('samples', 0):,}  (need >=2000")
+        lines.append("for a stable trough — using config as-is)")
+    else:
+        lines.append(f"samples:  {diag['samples']:,}")
+        lines.append(
+            f"spike:    {diag['spike_count']:,} "
+            f"({100 * diag['spike_frac']:.1f}%) < {diag['spike_edge_m']} m"
+        )
+        lines.append(f"trough:   {diag['trough_m']} m ({diag['trough_count']}/bin)")
+        lines.append("")
+        cp = current_primary
+        if cp is not None:
+            lines.append(
+                f"current:  primary {cp} m  -> {100 * _precision_at(hist, centers, spike, cp):.0f}% on-body"
+            )
+        if current_single is not None:
+            lines.append(f"          single {current_single} m")
+        lines.append(
+            f"suggest:  primary {diag['suggested_primary_m']} m  -> "
+            f"{100 * _precision_at(hist, centers, spike, diag['suggested_primary_m']):.0f}% on-body"
+        )
+        lines.append(f"          single  {diag['suggested_single_m']} m")
+        lines.append("")
+        lines.append("precision (on-body / accepted) by T:")
+        for t, acc, prec in diag["precision_table"]:
+            lines.append(f"   T={t:>4} m  acc={acc:>8,}  {100 * prec:5.1f}%")
+        if diag["suggested_primary_m"] != current_primary:
+            lines.append("")
+            lines.append("apply: DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M=")
+            lines.append(f"       {diag['suggested_primary_m']}  (+ ..._SINGLE_...={diag['suggested_single_m']})")
+            lines.append("or set DATASET_RADAR_AUTO_MARGIN=1")
+    ax.text(0.02, 0.98, "\n".join(lines), va="top", fontsize=9, family="monospace")
+
+
 def write_live_snapshot(out_dir: Path, snap: dict[str, Any]) -> None:
     """Lightweight progress file while the test is still running."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -934,7 +1217,10 @@ def write_report(
     )
     busiest_plot = write_busiest_frame_report(collector, out_dir)
 
-    fig, axes = plt.subplots(3, 3, figsize=(16, 14))
+    eff_primary = hit_match_max_margin_m if hit_match_max_margin_m is not None else hit_match_m
+    diag = collector.margin_threshold_diagnostics()
+
+    fig, axes = plt.subplots(4, 3, figsize=(16, 18))
     _plot_outcome_pie(axes[0, 0], snap)
     _plot_depth_hist(axes[0, 1], collector)
     _plot_velocity(axes[0, 2], collector)
@@ -944,6 +1230,15 @@ def write_report(
     _plot_co_visibility(axes[2, 0], collector)
     _plot_scatter(axes[2, 1], collector)
     axes[2, 2].axis("off")
+    _plot_margin_hist(
+        axes[3, 0], collector, diag,
+        current_primary=eff_primary, current_single=single_candidate_max_margin_m,
+    )
+    _plot_margin_precision(axes[3, 1], collector, diag, current_primary=eff_primary)
+    _plot_margin_text(
+        axes[3, 2], collector, diag,
+        current_primary=eff_primary, current_single=single_candidate_max_margin_m,
+    )
     with collector.lock:
         top_v = collector.points_by_vehicle.most_common(8)
         wc = snap.get("with_candidates", 0)
@@ -1049,6 +1344,39 @@ def write_report(
         "  - busiest_frame_points.csv",
         "  - summary.json",
     ]
+    dn = snap.get("density_per_radar_per_frame")
+    if dn:
+        bvc = dn.get("by_vehicle_class", {})
+        txt_lines.extend(
+            [
+                "",
+                f"Point density per radar per frame ({dn.get('radar_frames', 0):,} sweeps):",
+                f"  all returns: {dn.get('all', 0):.2f}   clutter: {dn.get('clutter_unmatched', 0):.2f}",
+                f"  matched:     {dn.get('matched', 0):.3f}  = vehicle {dn.get('vehicle', 0):.3f} "
+                f"(car {bvc.get('car', 0):.3f} + truck {bvc.get('truck', 0):.3f}) "
+                f"+ pedestrian {dn.get('pedestrian', 0):.3f}",
+            ]
+        )
+    if diag.get("enough_data"):
+        with collector.lock:
+            mhist = collector.margin_hist.copy()
+        mcenters = margin_bin_centers()
+        spike = float(diag.get("spike_count") or 0.0)
+        cur_p = 100 * _precision_at(mhist, mcenters, spike, eff_primary)
+        sug_p = 100 * _precision_at(mhist, mcenters, spike, diag["suggested_primary_m"])
+        txt_lines.extend(
+            [
+                "",
+                "Match-margin calibration (uncensored hit->OBB margin):",
+                f"  on-body spike:    {diag['spike_count']:,} "
+                f"({100 * diag['spike_frac']:.1f}%) within {diag['spike_edge_m']} m",
+                f"  trough:           {diag['trough_m']} m",
+                f"  current primary:  {eff_primary} m  -> {cur_p:.0f}% on-body",
+                f"  suggested:        primary {diag['suggested_primary_m']} m "
+                f"(-> {sug_p:.0f}% on-body), single {diag['suggested_single_m']} m",
+            ]
+        )
+
     bf = summary.get("busiest_frame")
     if bf:
         txt_lines.extend(

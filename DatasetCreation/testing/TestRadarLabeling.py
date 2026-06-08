@@ -359,6 +359,9 @@ def run_test(
                     actor_class=label["actor_class"],
                     match_bbox_margin_m=label["match_bbox_margin_m"],
                     nearest_bbox_margin_m=label["nearest_bbox_margin_m"],
+                    uncensored_nearest_bbox_margin_m=label[
+                        "uncensored_nearest_bbox_margin_m"
+                    ],
                 ),
                 legacy_matched=label["legacy_matched"],
             )
