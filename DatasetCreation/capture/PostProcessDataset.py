@@ -23,8 +23,13 @@ Transforms applied in-order to radar_data_labeled.csv:
      velocity_mps_noisy- Doppler with SNR-scaled Gaussian noise
      azimuth_rad_noisy - azimuth with SNR-scaled Gaussian noise
 
-Run:
+Importable entry point:
+    from capture.PostProcessDataset import post_process_capture_dir
+    post_process_capture_dir(run_dir, seed=42)
+
+CLI:
     python -m capture.PostProcessDataset --capture-dir <path>
+    python -m capture.PostProcessDataset --input <csv-path>
 """
 from __future__ import annotations
 
@@ -84,7 +89,6 @@ _SWERLING_SIGMA_DB = math.pi / math.sqrt(6.0) * 10.0 / math.log(10.0)
 # Specular spike model: occasional large RCS jumps due to coherent reflections
 # (metallic corners, flat surfaces at normal incidence, etc.)
 DEFAULT_SPIKE_PROB = {
-    # probability per frame of a specular spike event
     "pedestrian":  0.02,
     "car":         0.05,
     "truck":       0.04,
@@ -92,8 +96,8 @@ DEFAULT_SPIKE_PROB = {
     "bicycle":     0.03,
     "motorcycle":  0.03,
 }
-DEFAULT_SPIKE_DB_LO = 10.0   # spike magnitude: minimum (dB above baseline)
-DEFAULT_SPIKE_DB_HI = 25.0   # spike magnitude: maximum
+DEFAULT_SPIKE_DB_LO = 10.0
+DEFAULT_SPIKE_DB_HI = 25.0
 
 # Aspect-angle modulation: RCS is higher when the radar sees a large projected area
 # (broadside view) and lower for end-on views (front/rear).
@@ -102,9 +106,9 @@ DEFAULT_SPIKE_DB_HI = 25.0   # spike magnitude: maximum
 #   delta_dB = 0 when averaged over uniform aspect angles (unbiased)
 #   Range: [-amplitude/2, +amplitude/2] dB
 DEFAULT_ASPECT_AMPLITUDE_DB = {
-    "pedestrian":  4.0,   # body is more isotropic;  +/-2 dB
-    "car":         8.0,   # large flat sides vs small front;  +/-4 dB
-    "truck":      10.0,   # +/-5 dB
+    "pedestrian":  4.0,
+    "car":         8.0,
+    "truck":      10.0,
     "bus":         9.0,
     "bicycle":     5.0,
     "motorcycle":  5.0,
@@ -125,18 +129,18 @@ DEFAULT_MAX_WALKER_SPEED_MPS = 3.0
 # ---------------------------------------------------------------------------
 _C_LIGHT = 3e8
 
-DEFAULT_FMCW_CENTER_FREQ_HZ    = 76e9
-DEFAULT_FMCW_BANDWIDTH_HZ      = 400e6
-DEFAULT_FMCW_CHIRP_DURATION_S  = 19.74e-6
-DEFAULT_FMCW_N_CHIRPS          = 1024
-DEFAULT_FMCW_N_ADC_SAMPLES     = 256
-DEFAULT_FMCW_TX_POWER_DBM      = 14.0
-DEFAULT_FMCW_ANTENNA_GAIN_DBI  = 15.0
-DEFAULT_FMCW_NOISE_FIGURE_DB   = 12.0
-DEFAULT_FMCW_SYSTEM_LOSS_DB    = 3.0
-DEFAULT_FMCW_SNR_THRESHOLD_DB  = 10.0
-DEFAULT_FMCW_P_DETECT          = 0.9
-DEFAULT_FMCW_AZ_SIGMA_0_DEG    = 6.0
+DEFAULT_FMCW_CENTER_FREQ_HZ     = 76e9
+DEFAULT_FMCW_BANDWIDTH_HZ       = 400e6
+DEFAULT_FMCW_CHIRP_DURATION_S   = 19.74e-6
+DEFAULT_FMCW_N_CHIRPS           = 1024
+DEFAULT_FMCW_N_ADC_SAMPLES      = 256
+DEFAULT_FMCW_TX_POWER_DBM       = 14.0
+DEFAULT_FMCW_ANTENNA_GAIN_DBI   = 15.0
+DEFAULT_FMCW_NOISE_FIGURE_DB    = 12.0
+DEFAULT_FMCW_SYSTEM_LOSS_DB     = 3.0
+DEFAULT_FMCW_SNR_THRESHOLD_DB   = 10.0
+DEFAULT_FMCW_P_DETECT           = 0.9
+DEFAULT_FMCW_AZ_SIGMA_0_DEG     = 6.0
 DEFAULT_FMCW_AZ_SIGMA_FLOOR_DEG = 0.3
 
 
@@ -291,141 +295,105 @@ def _aspect_delta_dB(
     heading_y = math.sin(yaw_rad)
 
     cos_alpha = heading_x * los_x + heading_y * los_y
-    sin2_alpha = 1.0 - cos_alpha * cos_alpha   # in [0, 1]
+    sin2_alpha = 1.0 - cos_alpha * cos_alpha
 
     return amplitude_dB * (sin2_alpha - 0.5)
 
 
-# ---------------------------------------------------------------------------
-# FMCW performance
-# ---------------------------------------------------------------------------
-def _fmcw_performance(args: argparse.Namespace) -> dict:
-    f_c = args.fmcw_center_freq_hz
-    B   = args.fmcw_bandwidth_hz
-    T_c = args.fmcw_chirp_duration_s
-    N_s = args.fmcw_n_adc_samples
-    N_c = args.fmcw_n_chirps
-
-    lam     = _C_LIGHT / f_c
-    T_frame = N_c * T_c
-
+def _fmcw_performance(
+    center_freq_hz: float,
+    bandwidth_hz: float,
+    chirp_duration_s: float,
+    n_adc_samples: int,
+    n_chirps: int,
+    tx_power_dbm: float,
+    antenna_gain_dbi: float,
+    noise_figure_db: float,
+    system_loss_db: float,
+    az_sigma_0_deg: float,
+    az_sigma_floor_deg: float,
+) -> dict:
+    lam     = _C_LIGHT / center_freq_hz
+    T_frame = n_chirps * chirp_duration_s
     path_base = (
-        (args.fmcw_tx_power_dbm - 30.0)
-        + 2.0 * args.fmcw_antenna_gain_dbi
+        (tx_power_dbm - 30.0)
+        + 2.0 * antenna_gain_dbi
         + 20.0 * math.log10(lam)
         + 174.0
         + 10.0 * math.log10(T_frame)
         - 32.97
-        - args.fmcw_noise_figure_db
-        - args.fmcw_system_loss_db
+        - noise_figure_db
+        - system_loss_db
     )
     return {
         "lam": lam,
         "T_frame": T_frame,
-        "range_resolution_m":    _C_LIGHT / (2.0 * B),
-        "range_max_m":           N_s * _C_LIGHT / (4.0 * B),
-        "velocity_max_ms":       lam / (4.0 * T_c),
-        "velocity_resolution_ms": lam / (2.0 * N_c * T_c),
-        "path_base_dB":          path_base,
-        "az_sigma_0_rad":        math.radians(args.fmcw_az_sigma_0_deg),
-        "az_sigma_floor_rad":    math.radians(args.fmcw_az_sigma_floor_deg),
+        "range_resolution_m":     _C_LIGHT / (2.0 * bandwidth_hz),
+        "range_max_m":            n_adc_samples * _C_LIGHT / (4.0 * bandwidth_hz),
+        "velocity_max_ms":        lam / (4.0 * chirp_duration_s),
+        "velocity_resolution_ms": lam / (2.0 * n_chirps * chirp_duration_s),
+        "path_base_dB":           path_base,
+        "az_sigma_0_rad":         math.radians(az_sigma_0_deg),
+        "az_sigma_floor_rad":     math.radians(az_sigma_floor_deg),
     }
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Core post-processing (importable entry point)
 # ---------------------------------------------------------------------------
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--capture-dir", type=Path, default=None,
-                   help="Directory containing radar_data_labeled.csv and "
-                        "actor_frames.jsonl.")
-    p.add_argument("--input", type=Path, default=None,
-                   help="Direct path to radar_data_labeled.csv "
-                        "(--capture-dir not required; actor frames unavailable "
-                        "=> pedestrian Doppler fix and aspect-angle modulation "
-                        "are skipped automatically).")
+def post_process_capture_dir(
+    capture_dir=None,
+    *,
+    input_path=None,
+    micro_doppler_sigma: float = DEFAULT_MICRO_DOPPLER_SIGMA,
+    fd_stride: int = DEFAULT_FD_STRIDE,
+    max_walker_speed: float = DEFAULT_MAX_WALKER_SPEED_MPS,
+    seed: int = 0,
+    rcs_db_noise_enabled: bool = True,
+    rcs_spikes_enabled: bool = True,
+    rcs_aspect_enabled: bool = True,
+    no_fmcw_realism: bool = False,
+    fmcw_center_freq_hz: float = DEFAULT_FMCW_CENTER_FREQ_HZ,
+    fmcw_bandwidth_hz: float = DEFAULT_FMCW_BANDWIDTH_HZ,
+    fmcw_chirp_duration_s: float = DEFAULT_FMCW_CHIRP_DURATION_S,
+    fmcw_n_chirps: int = DEFAULT_FMCW_N_CHIRPS,
+    fmcw_n_adc_samples: int = DEFAULT_FMCW_N_ADC_SAMPLES,
+    fmcw_tx_power_dbm: float = DEFAULT_FMCW_TX_POWER_DBM,
+    fmcw_antenna_gain_dbi: float = DEFAULT_FMCW_ANTENNA_GAIN_DBI,
+    fmcw_noise_figure_db: float = DEFAULT_FMCW_NOISE_FIGURE_DB,
+    fmcw_system_loss_db: float = DEFAULT_FMCW_SYSTEM_LOSS_DB,
+    fmcw_snr_threshold_db: float = DEFAULT_FMCW_SNR_THRESHOLD_DB,
+    fmcw_p_detect: float = DEFAULT_FMCW_P_DETECT,
+    fmcw_az_sigma_0_deg: float = DEFAULT_FMCW_AZ_SIGMA_0_DEG,
+    fmcw_az_sigma_floor_deg: float = DEFAULT_FMCW_AZ_SIGMA_FLOOR_DEG,
+    out=None,
+) -> Path:
+    """Pedestrian-Doppler fix + RCS realism + FMCW post-process.
 
-    # -- pedestrian Doppler fix --
-    p.add_argument(
-        "--micro-doppler-sigma", type=float, default=DEFAULT_MICRO_DOPPLER_SIGMA,
-        help="Gaussian stddev (m/s) added to bulk pedestrian Doppler. 0 disables.",
-    )
-    p.add_argument(
-        "--fd-stride", type=int, default=DEFAULT_FD_STRIDE,
-        help="Central-difference stride in world ticks for walker velocity.",
-    )
-    p.add_argument(
-        "--max-walker-speed", type=float, default=DEFAULT_MAX_WALKER_SPEED_MPS,
-        help="Hard ceiling on bulk walker speed (m/s).",
-    )
+    Importable entry point; also invoked by CaptureRadarCameraData after
+    capture when DATASET_POSTPROCESS_AFTER_CAPTURE=1.
+    Returns the output Path; raises FileNotFoundError / RuntimeError on
+    bad input.
 
-    # -- RCS calibration --
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument(
-        "--rcs-db-noise", action="store_true", default=True,
-        help="Add Swerling-1 per-frame + per-actor offset noise to rcs_dBsm.",
-    )
-    p.add_argument(
-        "--no-rcs-db-noise", dest="rcs_db_noise", action="store_false",
-        help="Disable all RCS noise (median-only calibration).",
-    )
-    p.add_argument(
-        "--rcs-spikes", action="store_true", default=True,
-        help="Add specular spike events to rcs_dBsm.",
-    )
-    p.add_argument(
-        "--no-rcs-spikes", dest="rcs_spikes", action="store_false",
-        help="Disable specular spikes.",
-    )
-    p.add_argument(
-        "--rcs-aspect", action="store_true", default=True,
-        help="Apply aspect-angle RCS modulation (requires actor rotation in jsonl).",
-    )
-    p.add_argument(
-        "--no-rcs-aspect", dest="rcs_aspect", action="store_false",
-        help="Disable aspect-angle modulation.",
-    )
-
-    # -- FMCW realism --
-    p.add_argument("--fmcw-center-freq-hz",     type=float, default=DEFAULT_FMCW_CENTER_FREQ_HZ)
-    p.add_argument("--fmcw-bandwidth-hz",        type=float, default=DEFAULT_FMCW_BANDWIDTH_HZ)
-    p.add_argument("--fmcw-chirp-duration-s",    type=float, default=DEFAULT_FMCW_CHIRP_DURATION_S)
-    p.add_argument("--fmcw-n-chirps",            type=int,   default=DEFAULT_FMCW_N_CHIRPS)
-    p.add_argument("--fmcw-n-adc-samples",       type=int,   default=DEFAULT_FMCW_N_ADC_SAMPLES)
-    p.add_argument("--fmcw-tx-power-dbm",        type=float, default=DEFAULT_FMCW_TX_POWER_DBM)
-    p.add_argument("--fmcw-antenna-gain-dbi",    type=float, default=DEFAULT_FMCW_ANTENNA_GAIN_DBI)
-    p.add_argument("--fmcw-noise-figure-db",     type=float, default=DEFAULT_FMCW_NOISE_FIGURE_DB)
-    p.add_argument("--fmcw-system-loss-db",      type=float, default=DEFAULT_FMCW_SYSTEM_LOSS_DB)
-    p.add_argument("--fmcw-snr-threshold-db",    type=float, default=DEFAULT_FMCW_SNR_THRESHOLD_DB)
-    p.add_argument("--fmcw-p-detect",            type=float, default=DEFAULT_FMCW_P_DETECT,
-                   help="P(detection) when SNR >= threshold (Bernoulli trial).")
-    p.add_argument("--fmcw-az-sigma-0-deg",      type=float, default=DEFAULT_FMCW_AZ_SIGMA_0_DEG,
-                   help="Azimuth noise at unit SNR (degrees).")
-    p.add_argument("--fmcw-az-sigma-floor-deg",  type=float, default=DEFAULT_FMCW_AZ_SIGMA_FLOOR_DEG,
-                   help="Azimuth noise floor (degrees).")
-    p.add_argument(
-        "--no-fmcw-realism", action="store_true", default=False,
-        help="Skip FMCW realism step (no snr_dB / visible / noisy columns).",
-    )
-
-    p.add_argument("--out", type=Path, default=None,
-                   help="Output CSV path (defaults to overwriting the input).")
-    args = p.parse_args()
-
-    if args.input:
-        labeled = args.input
+    Either capture_dir (directory containing radar_data_labeled.csv and
+    actor_frames.jsonl) or input_path (direct CSV path) must be supplied.
+    When only input_path is given, pedestrian Doppler fix and aspect-angle
+    modulation are skipped (no actor_frames.jsonl available).
+    """
+    if input_path is not None:
+        labeled = Path(input_path)
         frames_path = None
-    elif args.capture_dir:
-        labeled     = args.capture_dir / LABELED_CSV
-        frames_path = args.capture_dir / ACTOR_FRAMES_JSONL
+    elif capture_dir is not None:
+        capture_dir = Path(capture_dir)
+        labeled     = capture_dir / LABELED_CSV
+        frames_path = capture_dir / ACTOR_FRAMES_JSONL
     else:
-        p.error("Provide --input <csv-path>  or  --capture-dir <dir>")
+        raise ValueError("Provide capture_dir or input_path.")
 
-    out = args.out or labeled
+    out = Path(out) if out is not None else labeled
 
     if not labeled.is_file():
-        sys.exit(f"Missing {labeled}")
+        raise FileNotFoundError(f"Missing {labeled}")
 
     has_frames = frames_path is not None and frames_path.is_file()
     if not has_frames:
@@ -437,7 +405,7 @@ def main() -> None:
             print("  No capture-dir given — "
                   "skipping pedestrian Doppler fix and aspect-angle modulation.",
                   flush=True)
-        args.rcs_aspect = False
+        rcs_aspect_enabled = False
 
     # ------------------------------------------------------------------ [1/4]
     if has_frames:
@@ -448,7 +416,7 @@ def main() -> None:
               f"{len(walker_actors)} distinct walkers", flush=True)
 
         actor_transforms: dict = {}
-        if args.rcs_aspect:
+        if rcs_aspect_enabled:
             actor_transforms = load_actor_transforms(frames_path)  # type: ignore[arg-type]
             print(f"      {len(actor_transforms):,} (frame, actor) transforms loaded "
                   f"for aspect-angle modulation", flush=True)
@@ -468,47 +436,52 @@ def main() -> None:
     print("[3/4] Calibrating RCS dBsm offsets ...", flush=True)
     offsets, info = class_offsets_from_data(labeled, DEFAULT_TARGET_MEDIAN_DBSM)
     if not offsets:
-        sys.exit("No matched rows with rcs_proxy_m2 — nothing to calibrate.")
+        raise RuntimeError("No matched rows with rcs_proxy_m2 — nothing to calibrate.")
     for klass, (med_m2, cur_db, tgt_db, off, n) in info.items():
         print(f"      {klass:<12} n={n:>7,}  median(m2)={med_m2:.4f}  "
               f"cur_dBsm={cur_db:+.2f}  tgt_dBsm={tgt_db:+.2f}  "
               f"offset={off:+.2f} dB", flush=True)
 
     noise_desc = []
-    if args.rcs_db_noise:
+    if rcs_db_noise_enabled:
         noise_desc.append("Swerling-1 per-frame + Gaussian per-actor")
-    if args.rcs_spikes:
+    if rcs_spikes_enabled:
         noise_desc.append(f"specular spikes [{DEFAULT_SPIKE_DB_LO:.0f}"
                           f"-{DEFAULT_SPIKE_DB_HI:.0f} dB]")
-    if args.rcs_aspect:
+    if rcs_aspect_enabled:
         noise_desc.append("aspect-angle modulation")
     print(f"      RCS realism: {' | '.join(noise_desc) if noise_desc else 'disabled'}",
           flush=True)
 
     # FMCW performance (derived once, used per-row)
     fmcw: dict | None = None
-    if not args.no_fmcw_realism:
-        fmcw = _fmcw_performance(args)
+    if not no_fmcw_realism:
+        fmcw = _fmcw_performance(
+            fmcw_center_freq_hz, fmcw_bandwidth_hz, fmcw_chirp_duration_s,
+            fmcw_n_adc_samples, fmcw_n_chirps,
+            fmcw_tx_power_dbm, fmcw_antenna_gain_dbi,
+            fmcw_noise_figure_db, fmcw_system_loss_db,
+            fmcw_az_sigma_0_deg, fmcw_az_sigma_floor_deg,
+        )
         print(f"\n  FMCW realism (RS35-like preset):", flush=True)
-        print(f"    f_c={args.fmcw_center_freq_hz/1e9:.3f} GHz  "
-              f"B={args.fmcw_bandwidth_hz/1e6:.0f} MHz  "
-              f"N_s={args.fmcw_n_adc_samples}  N_c={args.fmcw_n_chirps}", flush=True)
+        print(f"    f_c={fmcw_center_freq_hz/1e9:.3f} GHz  "
+              f"B={fmcw_bandwidth_hz/1e6:.0f} MHz  "
+              f"N_s={fmcw_n_adc_samples}  N_c={fmcw_n_chirps}", flush=True)
         print(f"    dR={fmcw['range_resolution_m']:.3f} m  "
               f"R_max={fmcw['range_max_m']:.1f} m  "
               f"v_max={fmcw['velocity_max_ms']:.1f} m/s  "
               f"dv={fmcw['velocity_resolution_ms']:.3f} m/s", flush=True)
-        print(f"    SNR_thr={args.fmcw_snr_threshold_db:.1f} dB  "
-              f"P_det={args.fmcw_p_detect:.2f}  "
-              f"az_sigma_0={args.fmcw_az_sigma_0_deg:.1f} deg  "
-              f"az_floor={args.fmcw_az_sigma_floor_deg:.1f} deg", flush=True)
+        print(f"    SNR_thr={fmcw_snr_threshold_db:.1f} dB  "
+              f"P_det={fmcw_p_detect:.2f}  "
+              f"az_sigma_0={fmcw_az_sigma_0_deg:.1f} deg  "
+              f"az_floor={fmcw_az_sigma_floor_deg:.1f} deg", flush=True)
 
     # ------------------------------------------------------------------ [4/4]
     print(f"\n[4/4] Rewriting {out.name} ...", flush=True)
 
-    rng = random.Random(args.seed)
-    fd  = args.fd_stride
+    rng = random.Random(seed)
+    fd  = fd_stride
 
-    # Deterministic per-actor and per-frame RCS offset caches (reproducible).
     actor_offset_cache: dict = {}
     frame_offset_cache: dict = {}
 
@@ -521,7 +494,7 @@ def main() -> None:
         key = (klass, actor_id)
         if key not in actor_offset_cache:
             actor_offset_cache[key] = random.Random(
-                f"{args.seed}|{klass}|{actor_id}|actor"
+                f"{seed}|{klass}|{actor_id}|actor"
             ).gauss(0.0, sa)
         return actor_offset_cache[key]
 
@@ -533,7 +506,7 @@ def main() -> None:
         sf = sigmas[1]
         key = (klass, actor_id, frame_id)
         if key not in frame_offset_cache:
-            local_rng = random.Random(f"{args.seed}|{klass}|{actor_id}|{frame_id}")
+            local_rng = random.Random(f"{seed}|{klass}|{actor_id}|{frame_id}")
             frame_offset_cache[key] = _swerling1_dB(local_rng, sf)
         return frame_offset_cache[key]
 
@@ -543,7 +516,7 @@ def main() -> None:
         "snr_written": 0, "visible_1": 0,
         "invis_range": 0, "invis_vel": 0, "invis_snr": 0,
     }
-    max_walker_speed = max(0.1, float(args.max_walker_speed))
+    max_walker_speed = max(0.1, float(max_walker_speed))
 
     FMCW_COLS = ["snr_dB", "visible",
                  "depth_m_noisy", "velocity_mps_noisy", "azimuth_rad_noisy"]
@@ -605,8 +578,8 @@ def main() -> None:
                                 uy /= n
                                 uz /= n
                                 v_rad = vx*ux + vy*uy + vz*uz
-                                if args.micro_doppler_sigma > 0:
-                                    v_rad += rng.gauss(0.0, args.micro_doppler_sigma)
+                                if micro_doppler_sigma > 0:
+                                    v_rad += rng.gauss(0.0, micro_doppler_sigma)
                                 row["velocity_mps"] = f"{v_rad:.6f}"
                                 stats["walker_fixed"] += 1
                             else:
@@ -627,7 +600,7 @@ def main() -> None:
                         if v > 0:
                             dbsm = 10.0 * math.log10(v) + offsets[klass]
 
-                            if args.rcs_db_noise and aid_raw:
+                            if rcs_db_noise_enabled and aid_raw:
                                 try:
                                     actor_id_int = int(aid_raw)
                                     dbsm += _actor_offset(klass, actor_id_int)
@@ -637,10 +610,10 @@ def main() -> None:
                                 except ValueError:
                                     pass
 
-                            if args.rcs_spikes and aid_raw:
+                            if rcs_spikes_enabled and aid_raw:
                                 spike_p = DEFAULT_SPIKE_PROB.get(klass, 0.0)
                                 spike_rng = random.Random(
-                                    f"{args.seed}|{klass}|{aid_raw}|{frame_id}|spike"
+                                    f"{seed}|{klass}|{aid_raw}|{frame_id}|spike"
                                 )
                                 if spike_rng.random() < spike_p:
                                     dbsm += spike_rng.uniform(
@@ -648,7 +621,7 @@ def main() -> None:
                                     )
                                     stats["spikes"] += 1
 
-                            if args.rcs_aspect and aid_raw:
+                            if rcs_aspect_enabled and aid_raw:
                                 try:
                                     tf = actor_transforms.get(
                                         (frame_id, int(aid_raw))
@@ -685,9 +658,9 @@ def main() -> None:
                     range_ok    = depth_m <= fmcw["range_max_m"]
                     velocity_ok = abs(vel_mps) <= fmcw["velocity_max_ms"]
 
-                    snr_dB_out       = ""
-                    snr_ok           = True
-                    snr_lin_noise    = 1.0
+                    snr_dB_out    = ""
+                    snr_ok        = True
+                    snr_lin_noise = 1.0
 
                     if rcs_dBsm_val is not None and depth_m > 0.01:
                         snr_dB_val = (
@@ -697,8 +670,8 @@ def main() -> None:
                         )
                         snr_dB_out    = f"{snr_dB_val:.4f}"
                         snr_lin_noise = max(10.0 ** (snr_dB_val / 10.0), 0.01)
-                        if snr_dB_val >= args.fmcw_snr_threshold_db:
-                            snr_ok = rng.random() < args.fmcw_p_detect
+                        if snr_dB_val >= fmcw_snr_threshold_db:
+                            snr_ok = rng.random() < fmcw_p_detect
                         else:
                             snr_ok = False
                         stats["snr_written"] += 1
@@ -711,9 +684,10 @@ def main() -> None:
                         if not velocity_ok: stats["invis_vel"]   += 1
                         if not snr_ok:      stats["invis_snr"]   += 1
 
-                    sqrt_snr = math.sqrt(snr_lin_noise)
-                    sig_r  = fmcw["range_resolution_m"]     / (2.0 * sqrt_snr)
-                    sig_v  = fmcw["velocity_resolution_ms"] / (2.0 * sqrt_snr)
+                    sqrt_2snr = math.sqrt(2.0 * snr_lin_noise)
+                    sqrt_snr  = math.sqrt(snr_lin_noise)
+                    sig_r  = fmcw["range_resolution_m"]     / sqrt_2snr
+                    sig_v  = fmcw["velocity_resolution_ms"] / sqrt_2snr
                     sig_az = max(
                         fmcw["az_sigma_0_rad"] / sqrt_snr,
                         fmcw["az_sigma_floor_rad"],
@@ -752,6 +726,101 @@ def main() -> None:
         print(f"  invisible (SNR / P_d)       : {stats['invis_snr']:,}", flush=True)
 
     print(f"Done -> {out}", flush=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--capture-dir", type=Path, default=None,
+                   help="Directory containing radar_data_labeled.csv and "
+                        "actor_frames.jsonl.")
+    p.add_argument("--input", type=Path, default=None,
+                   help="Direct path to radar_data_labeled.csv "
+                        "(actor frames unavailable => pedestrian Doppler fix "
+                        "and aspect-angle modulation are skipped automatically).")
+
+    # -- pedestrian Doppler fix --
+    p.add_argument("--micro-doppler-sigma", type=float,
+                   default=DEFAULT_MICRO_DOPPLER_SIGMA,
+                   help="Gaussian stddev (m/s) added to bulk pedestrian Doppler. "
+                        "0 disables.")
+    p.add_argument("--fd-stride", type=int, default=DEFAULT_FD_STRIDE,
+                   help="Central-difference stride in world ticks for walker velocity.")
+    p.add_argument("--max-walker-speed", type=float,
+                   default=DEFAULT_MAX_WALKER_SPEED_MPS,
+                   help="Hard ceiling on bulk walker speed (m/s).")
+
+    # -- RCS calibration --
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rcs-db-noise", action="store_true", default=True,
+                   help="Add Swerling-1 per-frame + per-actor offset noise to rcs_dBsm.")
+    p.add_argument("--no-rcs-db-noise", dest="rcs_db_noise", action="store_false",
+                   help="Disable all RCS noise (median-only calibration).")
+    p.add_argument("--rcs-spikes", action="store_true", default=True,
+                   help="Add specular spike events to rcs_dBsm.")
+    p.add_argument("--no-rcs-spikes", dest="rcs_spikes", action="store_false",
+                   help="Disable specular spikes.")
+    p.add_argument("--rcs-aspect", action="store_true", default=True,
+                   help="Apply aspect-angle RCS modulation.")
+    p.add_argument("--no-rcs-aspect", dest="rcs_aspect", action="store_false",
+                   help="Disable aspect-angle modulation.")
+
+    # -- FMCW realism --
+    p.add_argument("--fmcw-center-freq-hz",    type=float, default=DEFAULT_FMCW_CENTER_FREQ_HZ)
+    p.add_argument("--fmcw-bandwidth-hz",       type=float, default=DEFAULT_FMCW_BANDWIDTH_HZ)
+    p.add_argument("--fmcw-chirp-duration-s",   type=float, default=DEFAULT_FMCW_CHIRP_DURATION_S)
+    p.add_argument("--fmcw-n-chirps",           type=int,   default=DEFAULT_FMCW_N_CHIRPS)
+    p.add_argument("--fmcw-n-adc-samples",      type=int,   default=DEFAULT_FMCW_N_ADC_SAMPLES)
+    p.add_argument("--fmcw-tx-power-dbm",       type=float, default=DEFAULT_FMCW_TX_POWER_DBM)
+    p.add_argument("--fmcw-antenna-gain-dbi",   type=float, default=DEFAULT_FMCW_ANTENNA_GAIN_DBI)
+    p.add_argument("--fmcw-noise-figure-db",    type=float, default=DEFAULT_FMCW_NOISE_FIGURE_DB)
+    p.add_argument("--fmcw-system-loss-db",     type=float, default=DEFAULT_FMCW_SYSTEM_LOSS_DB)
+    p.add_argument("--fmcw-snr-threshold-db",   type=float, default=DEFAULT_FMCW_SNR_THRESHOLD_DB)
+    p.add_argument("--fmcw-p-detect",           type=float, default=DEFAULT_FMCW_P_DETECT)
+    p.add_argument("--fmcw-az-sigma-0-deg",     type=float, default=DEFAULT_FMCW_AZ_SIGMA_0_DEG)
+    p.add_argument("--fmcw-az-sigma-floor-deg", type=float, default=DEFAULT_FMCW_AZ_SIGMA_FLOOR_DEG)
+    p.add_argument("--no-fmcw-realism", action="store_true", default=False,
+                   help="Skip FMCW realism step.")
+
+    p.add_argument("--out", type=Path, default=None,
+                   help="Output CSV path (defaults to overwriting the input).")
+    args = p.parse_args()
+
+    if args.input is None and args.capture_dir is None:
+        p.error("Provide --input <csv-path>  or  --capture-dir <dir>")
+
+    try:
+        post_process_capture_dir(
+            args.capture_dir,
+            input_path=args.input,
+            micro_doppler_sigma=args.micro_doppler_sigma,
+            fd_stride=args.fd_stride,
+            max_walker_speed=args.max_walker_speed,
+            seed=args.seed,
+            rcs_db_noise_enabled=args.rcs_db_noise,
+            rcs_spikes_enabled=args.rcs_spikes,
+            rcs_aspect_enabled=args.rcs_aspect,
+            no_fmcw_realism=args.no_fmcw_realism,
+            fmcw_center_freq_hz=args.fmcw_center_freq_hz,
+            fmcw_bandwidth_hz=args.fmcw_bandwidth_hz,
+            fmcw_chirp_duration_s=args.fmcw_chirp_duration_s,
+            fmcw_n_chirps=args.fmcw_n_chirps,
+            fmcw_n_adc_samples=args.fmcw_n_adc_samples,
+            fmcw_tx_power_dbm=args.fmcw_tx_power_dbm,
+            fmcw_antenna_gain_dbi=args.fmcw_antenna_gain_dbi,
+            fmcw_noise_figure_db=args.fmcw_noise_figure_db,
+            fmcw_system_loss_db=args.fmcw_system_loss_db,
+            fmcw_snr_threshold_db=args.fmcw_snr_threshold_db,
+            fmcw_p_detect=args.fmcw_p_detect,
+            fmcw_az_sigma_0_deg=args.fmcw_az_sigma_0_deg,
+            fmcw_az_sigma_floor_deg=args.fmcw_az_sigma_floor_deg,
+            out=args.out,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":

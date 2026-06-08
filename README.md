@@ -1,281 +1,325 @@
 # CARLA Radar & Camera Dataset Creation
 
-This repository is a **CARLA 0.9.16** install plus Python tools under `Scripts/DatasetCreation/` that:
+Python tooling (under `DatasetCreation/`) on top of **CARLA 0.9.16** that:
 
-- Place radar and camera sensors on a fixed layout (4, 8, 12, or 14 radars)
-- Spawn traffic, pedestrians, and controlled traffic lights
-- Record synchronized radar detections and camera frames
-- Export sensor extrinsics and radar labeling QA reports
+- Places a fixed layout of **4 / 8 / 12 / 14 radars** plus cameras on `Town10HD_Opt`
+- Spawns drive-in traffic, pedestrians, and controlled traffic lights
+- Records synchronized radar detections + camera frames
+- **Labels each radar return** to the actor it hit (with a data-grounded match margin)
+- Exports sensor extrinsics and a radar-labeling QA report
 
-The main entry point is **`Start.py`**, which launches the full script stack for you.
+The pipeline is driven by **`run_sim.sh`** (Linux one-shot) or **`Start.py`** (cross-platform launcher).
+
+---
+
+## Repository layout
+
+```
+DatasetCreation/
+├── run_sim.sh                 # Linux one-shot: starts CARLA + map + Start.py
+├── Start.py                   # Launcher: spawns the script stack (interactive or flags)
+├── carla_connect.py           # Connection helpers (host/port/timeouts)
+├── setup/                     # RadarCameraSetup{4,8,12,14}.py — sensor layouts
+├── world/                     # Traffic, pedestrians, traffic lights, cleanup
+│   ├── SpawnCarsAtPosition14.py
+│   ├── SpawnPedestriansAcrossMap.py
+│   ├── TrafficLightSetup.py / TrafficLightControl.py
+│   └── Clear*.py / DespawnAllCars.py
+├── capture/                   # Recording + labeling
+│   ├── CaptureRadarCameraData.py   # the recorder
+│   ├── LabelRadarCapture.py        # offline labeler (radar_data_labeled.csv)
+│   ├── actor_frame_log.py          # per-frame actor pose log
+│   └── Export{Radar,Camera}Extrinsics.py
+├── testing/
+│   ├── TestRadarLabeling.py        # short labeling-validation run (no full CSV)
+│   └── RadarLabelingTestReport.py  # QA plots + summary + margin calibration
+└── tools/
+    ├── derive_match_threshold_uncensored.py  # ad-hoc margin analysis
+    ├── PrintRadarLayoutExtrinsics.py
+    └── FetchActorSizing.py
+```
 
 ---
 
 ## Requirements
 
 | Item | Notes |
-|------|--------|
-| **OS** | Windows 10/11 (scripts are tested on Windows; `msvcrt` is used for keyboard input) |
-| **GPU** | Discrete GPU recommended for CARLA |
-| **CARLA** | **0.9.16** (must match the Python `carla` package version) |
-| **Python** | **3.10–3.12** (this project uses a `.venv` with Python 3.12) |
-| **Map** | **`Town10HD_Opt`** — sensor positions and traffic logic assume this map |
+|------|-------|
+| **CARLA** | **0.9.16** — the Python `carla` wheel must match the simulator version |
+| **Python** | **3.10–3.12** in a dedicated venv (this host uses `~/carla_pim_venv`, Python 3.12) |
+| **Map** | **`Town10HD_Opt`** — all sensor poses and traffic logic assume this map |
+| **OS** | Linux (primary; `run_sim.sh`) or Windows (run `Start.py` from an activated venv) |
+| **GPU** | Discrete GPU recommended; `run_sim.sh` starts CARLA with `-RenderOffScreen` |
 
 ---
 
-## First-time setup
+## First-time setup (Linux)
 
-### 1. Install CARLA (if you do not have it yet)
+```bash
+# 1. Create the venv and install deps (once)
+python3.12 -m venv ~/carla_pim_venv
+source ~/carla_pim_venv/bin/activate
+pip install -r DatasetCreation/requirements.txt
+pip install carla==0.9.16        # must match the simulator
 
-**Option A — Use this folder (recommended if you cloned or copied `CARLA_Latest`)**
+# 2. Point run_sim.sh at your CARLA install if it isn't the default
+#    (defaults: VENV=~/carla_pim_venv, CARLA_DIR=/scratch/tamoghnd/CARLA_0.9.16)
+```
 
-If `CarlaUE4.exe` exists in the project root, you already have the simulator binaries. Skip to step 2.
-
-**Option B — Download CARLA 0.9.16**
-
-1. Download the **Windows** package for CARLA **0.9.16** from the official release page:  
-   [https://github.com/carla-simulator/carla/releases/tag/0.9.16](https://github.com/carla-simulator/carla/releases/tag/0.9.16)
-2. Extract the archive to a folder of your choice (for example `C:\CARLA_0.9.16`).
-3. Copy or merge this repo’s `Scripts/DatasetCreation/` folder into that install, **or** clone this repo and replace its `CarlaUE4.exe` / `Engine` / `CarlaUE4` content with the extracted CARLA package so versions stay aligned.
-
-> **Version match:** The Python API wheel must be the same CARLA version as the simulator. This project targets **0.9.16**.
+`run_sim.sh` activates the venv, starts the CARLA server if one isn't already
+listening, loads `Town10HD_Opt`, and points captures at a scratch directory — so
+on a configured host you don't manage any of that by hand.
 
 ---
 
-### 2. Python virtual environment
+## Generate your first dataset
 
-Open PowerShell in the **project root** (where `CarlaUE4.exe` lives):
+### The fast path — `run_sim.sh`
 
-```powershell
-cd C:\path\to\CARLA_Latest
+From `DatasetCreation/`:
 
-# Create venv (once)
-python -m venv .venv
+```bash
+# Full capture, 4-radar layout (writes a sensor_capture_* folder):
+./run_sim.sh --radar-count 4
 
-# Activate
-.\.venv\Scripts\Activate.ps1
+# 12-radar full capture:
+./run_sim.sh --radar-count 12
 
-# Dataset scripts dependencies
-pip install -r Scripts\DatasetCreation\requirements.txt
+# Quick labeling sanity check (no full CSV, ~live stats):
+./run_sim.sh --radar-count 4 --test-labeling
 
-# CARLA Python API (must match simulator version)
-pip install carla==0.9.16
+# No args == test labeling with 4 radars (the safe default):
+./run_sim.sh
 ```
 
-If activation is blocked by execution policy, run once:
+> **Note:** any argument you pass replaces the default `--radar-count 4 --test-labeling`,
+> so `--radar-count 4` **alone** means a *full capture*, not a test run.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
+What it does, in order: activate venv → start CARLA (if needed) → wait for the RPC
+port → load `Town10HD_Opt` → set the capture directory → run `Start.py`, which
+spawns sensors, traffic, pedestrians, lights, then `CaptureRadarCameraData.py`.
 
----
+**Handy `run_sim.sh` environment toggles** (prefix the command):
 
-### 3. Verify CARLA and Python can talk
+| Var | Default | Effect |
+|-----|---------|--------|
+| `KEEP_SERVER` | `0` | `1` = leave CARLA running after `Start.py` exits |
+| `VENV` | `~/carla_pim_venv` | Path to the Python venv |
+| `CARLA_DIR` | `/scratch/tamoghnd/CARLA_0.9.16` | CARLA install (must contain `CarlaUE4.sh`) |
+| `DATASET_CAPTURE_BASE_DIR` | `/scratch/tamoghnd/dataset_captures` | Where `sensor_capture_*` folders are written |
+| `RPC_PORT` / `MAP` | `2000` / `Town10HD_Opt` | CARLA RPC port / map to load |
 
-**Terminal 1 — start the simulator:**
+Example: `KEEP_SERVER=1 ./run_sim.sh --radar-count 12`
 
-```powershell
-cd C:\path\to\CARLA_Latest
-.\CarlaUE4.exe
-```
+### The manual path — `Start.py` (any OS)
 
-Wait until the CARLA window is open and the server is listening (default port **2000**).
+1. Start CARLA yourself and load `Town10HD_Opt`.
+2. From an activated venv, in `DatasetCreation/`:
 
-**Terminal 2 — test the API:**
-
-```powershell
-cd C:\path\to\CARLA_Latest
-.\.venv\Scripts\Activate.ps1
-python PythonAPI\util\test_connection.py
-```
-
-You should see a successful connection message. If it times out, confirm `CarlaUE4.exe` is running and no firewall is blocking port 2000.
-
----
-
-### 4. Load the correct map
-
-Before running dataset scripts, load **`Town10HD_Opt`** in the simulator.
-
-**In the CARLA editor / spectator UI:** use the map selector to open `Town10HD_Opt`.
-
-**Or from Python** (with CARLA running):
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -c "import carla; c=carla.Client('localhost',2000); c.set_timeout(30); c.load_world('Town10HD_Opt'); print(c.get_world().get_map().name)"
-```
-
-Radar/camera transforms and traffic-light behavior are tuned for this map. Other maps may run but positions and QA results will not match the bundled extrinsic reference files.
-
----
-
-## Quick start (typical workflow)
-
-You need **two terminals**: one for the simulator, one for the dataset pipeline.
-
-### Terminal 1 — CARLA server
-
-```powershell
-cd C:\path\to\CARLA_Latest
-.\CarlaUE4.exe
-```
-
-Load **`Town10HD_Opt`**, then leave CARLA running.
-
-### Terminal 2 — dataset pipeline
-
-```powershell
-cd C:\path\to\CARLA_Latest
-.\.venv\Scripts\Activate.ps1
-cd Scripts\DatasetCreation
-python Start.py
-```
-
-`Start.py` will ask:
-
-1. **Radar count** — `4`, `8`, `12`, or `14` (menu `1`–`3` map to 4, 8, 12; type `14` for fourteen radars)
-2. **Run mode**
-   - **Full dataset** — spawns sensors, traffic, lights, then runs `CaptureRadarCameraData.py`
-   - **Test radar labeling** — shorter run with `TestRadarLabeling.py` and live stats (no full capture CSV)
-
-Non-interactive example:
-
-```powershell
-python Start.py --radar-count 14
+```bash
+python Start.py                       # interactive: asks radar count + mode
+python Start.py --radar-count 14      # full capture, 14 radars
 python Start.py --radar-count 12 --test-labeling
 ```
 
-### Stop the pipeline
+### Stopping a run
 
-| Mode | How to stop | What happens |
-|------|-------------|--------------|
-| **Full dataset** | **Ctrl+C** in the `Start.py` terminal | Exports camera + radar extrinsics into the active `sensor_capture_*` folder, stops child scripts, despawns dataset vehicles |
-| **Test labeling** | **Ctrl+C** or **Enter** (depending on which script has focus) | Requests `TestRadarLabeling.py` to finish reports (plots, `summary.txt`, CSVs) |
-| **Capture only** (`CaptureRadarCameraData.py` alone) | **Enter** in that script’s window | Closes CSVs, writes extrinsics and `radar_labeling_qa/` into the capture folder |
+| Mode | Stop with | What happens |
+|------|-----------|--------------|
+| **Full capture** | **Ctrl+C** in the `Start.py` terminal | Closes CSVs, exports extrinsics, writes `radar_labeling_qa/`, runs offline labeling → `radar_data_labeled.csv`, despawns dataset vehicles |
+| **Test labeling** | **Ctrl+C** / **Enter** | `TestRadarLabeling.py` finalizes plots, `summary.txt`, CSVs |
 
-Keep **CARLA running** until extrinsic export messages finish.
-
----
-
-## What `Start.py` launches
-
-### Full dataset mode (default)
-
-Rough order:
-
-1. `RadarCameraSetup{4,8,12,14}.py` — spawns tagged `dataset_radar_*` and `dataset_camera_*` sensors
-2. `ClearParkedCarsAndMotorcycles.py` / `ClearTrashCansAndMailboxes.py`
-3. `SpawnCarsAtPosition14.py` — free-roaming traffic near the sensor corridor
-4. `SpawnPedestriansAcrossMap.py` — navmesh pedestrians (default **30**)
-5. `TrafficLightSetup.py` + `TrafficLightControl.py` (GUI in a separate console on Windows)
-6. `CaptureRadarCameraData.py` — records data until you stop the stack
-
-### Test labeling mode (`--test-labeling`)
-
-Setup + traffic + `TestRadarLabeling.py` only. Outputs go to `radar_labeling_test_YYYYMMDD_HHMMSS/` with live stats in the console every ~2 seconds.
-
-### Not auto-started (run manually if needed)
-
-| Script | Purpose |
-|--------|---------|
-| `TestRadarLabeling.py` | Standalone labeling validation |
-| `PrintRadarLayoutExtrinsics.py` | Print/export radar layout poses (needs CARLA + map) |
-| `ExportRadarExtrinsics.py` / `ExportCameraExtrinsics.py` | Extrinsics export utilities |
-| `FetchActorSizing.py` | Build actor size catalog |
-| `DespawnAllCars.py` | Remove spawned vehicles |
+Keep CARLA alive until the extrinsic-export / labeling messages finish.
 
 ---
 
-## Output folders
+## Tuning the scene
 
-All capture output is written under `Scripts/DatasetCreation/` unless `DATASET_CAPTURE_BASE_DIR` is set.
+Set these before launching (or `export` them; `run_sim.sh` inherits your shell env).
+
+```bash
+# More cars and people, denser radar, slower traffic:
+DATASET_TARGET_CAR_COUNT=60 DATASET_PEDESTRIAN_COUNT=50 \
+DATASET_RADAR_POINTS_PER_SECOND=20000 DATASET_VEHICLE_SPEED_REDUCTION_PCT=25 \
+./run_sim.sh --radar-count 12
+```
+
+| Knob | Default | What it does |
+|------|---------|--------------|
+| `--radar-count` (CLI) | prompt | Sensor layout: `4`, `8`, `12`, or `14` |
+| `DATASET_TARGET_CAR_COUNT` | `30` | Vehicles to spawn |
+| `DATASET_PEDESTRIAN_COUNT` | `30` | Pedestrians to spawn |
+| `DATASET_SPAWN_RADIUS_M` | `80.0` | Outer radius of the spawn annulus around the corridor |
+| `DATASET_SPAWN_EXCLUSION_RADIUS_M` | `0.0` | Inner radius cars must drive *in* from (`0` = fill the zone) |
+| `DATASET_VEHICLE_SPEED_REDUCTION_PCT` | `-100.0` | % slower than the speed limit. Negative = faster; `-100` ≈ 2× limit, `25` = 25% slower |
+| `DATASET_FREE_VEHICLE_DRIVING` | `1` | `1` = vehicles drive (Doppler/velocity); `0` = parked |
+| `DATASET_RADAR_POINTS_PER_SECOND` | `15000` | Ray density per radar (CARLA clamps at 20000). Higher = denser returns, more CPU |
+| `DATASET_AUTOMATIC_TRAFFIC_LIGHTS` | `0` | `1` = all lights free-run; `0` = perimeter cycling (recommended) |
+
+---
+
+## Radar labeling & the match margin
+
+After a full capture, each radar return is matched to the actor whose oriented
+bounding box (OBB) it hit, producing `radar_data_labeled.csv`. A return is accepted
+when its distance to the nearest actor's OBB surface (after a `0.75 m` extent
+inflation) is within the **match margin**.
+
+The defaults are **data-grounded**, not guessed:
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M` | `0.5` | Primary accept margin (m). Clamped `0.5–25` |
+| `DATASET_RADAR_SINGLE_CANDIDATE_MAX_MARGIN_M` | `1.0` | Looser margin when exactly one actor is in the beam. Clamped `0.5–25` |
+| `DATASET_RADAR_CANDIDATE_HIT_MAX_BBOX_MARGIN_M` | `7.0` | Pre-filter: actors farther than this from the hit aren't candidates |
+| `DATASET_LABELABLE_MIN_SPEED_MPS` | `0.0` | Skip returns slower than this when scoring (e.g. `0.5` to drop near-static clutter) |
+
+**Why 0.5 / 1.0?** On a real capture the uncensored hit→OBB-margin distribution is a
+sharp spike at ~0 (genuine on-body hits) followed by a clutter ramp with no second
+lobe — so wider margins just admit road/structure clutter. On-body precision:
+`0.5 m → 87%`, `1.5 m → 53%`, `2.0 m → 42%`. The trough sits at ~0.2 m; `0.5 m`
+keeps a little slack.
+
+**Every capture self-documents.** `radar_labeling_qa/radar_labeling_summary.png`
+now includes a margin panel (histogram + precision-vs-threshold curve + a suggested
+threshold), and the numbers are written to `summary.json` / `summary.txt`. Re-derive
+per capture because the trough shifts with ray density and traffic speed.
+
+**Let the labeler pick the margin for you** (instead of the fixed default):
+
+| Param / flag | Default | Effect |
+|--------------|---------|--------|
+| `--auto-margin` / `DATASET_RADAR_AUTO_MARGIN=1` | off | Derive the margin from this capture's own distribution and apply it |
+| `--auto-margin-stride` / `DATASET_RADAR_AUTO_MARGIN_STRIDE` | `20` | Sample every Nth frame during derivation (lower = more samples, slower) |
+
+```bash
+# Re-label an existing capture with the fixed defaults:
+python -m capture.LabelRadarCapture --capture-dir <sensor_capture_dir>
+
+# Re-label, deriving the margin from the capture itself:
+python -m capture.LabelRadarCapture --capture-dir <sensor_capture_dir> --auto-margin
+
+# Just analyze the margin distribution without re-labeling:
+python tools/derive_match_threshold_uncensored.py <sensor_capture_dir> [frame_stride]
+```
+
+Leave `--auto-margin` off for reproducible dataset runs (a fixed, documented
+threshold); turn it on for sparse-pps or high-speed captures where the trough moves.
+
+---
+
+## Output
+
+Captures land in `DATASET_CAPTURE_BASE_DIR` (or `DatasetCreation/` if unset).
 
 ### Full capture — `sensor_capture_YYYYMMDD_HHMMSS/`
 
 | File / folder | Description |
 |---------------|-------------|
-| `radar_data.csv` | Radar detections, poses, labeling fields |
-| `camera_data.csv` | Camera frame metadata |
-| `camera_frames/` | Saved RGB images |
-| `camera_extrinsics.csv` / `.json` | Camera poses in world frame |
-| `radar_extrinsics.csv` / `.json` or `sensor_extrinsics.*` | Radar poses |
-| `radar_labeling_qa/` | Per-frame and per-sensor labeling QA CSVs |
-
-The active run is tracked in `.last_dataset_capture_dir`.
+| `radar_data.csv` | Raw radar detections + sensor poses |
+| `radar_data_labeled.csv` | Same rows + matched actor, class, bbox margin, RCS proxy, dBsm |
+| `actor_frames.jsonl` | Per-frame actor poses/bboxes (drives offline labeling; no CARLA needed) |
+| `camera_data.csv` / `camera_frames/` | Camera frame metadata / saved RGB images |
+| `*_extrinsics.csv` / `.json` | Radar + camera poses in the world frame |
+| `radar_labeling_qa/` | `radar_labeling_summary.png` (incl. margin panel), `summary.json`, `summary.txt`, per-frame/per-sensor/per-vehicle CSVs |
 
 ### Test run — `radar_labeling_test_YYYYMMDD_HHMMSS/`
 
-Includes `summary.txt`, `summary.json`, plots (`radar_labeling_summary.png`, etc.), and diagnostic CSVs. Tracked in `.last_radar_labeling_test_dir`.
+`summary.txt` / `summary.json`, the QA plots, and diagnostic CSVs — but no full capture CSV.
 
 ---
 
-## Environment variables (optional)
+## Full environment-variable reference
 
-Set these before `Start.py` or individual scripts if you need to override defaults:
+All optional; set before `run_sim.sh` / `Start.py` / a script. Booleans accept `1/true/yes/on`.
+
+### Connection
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `DATASET_EXPECTED_RADAR_COUNT` | Set by `Start.py` | Number of radar labels (`R1`…`Rn`) |
+| `DATASET_CARLA_HOST` | `127.0.0.1` | CARLA server host |
+| `DATASET_CARLA_PORT` | `2000` | CARLA RPC port |
+| `DATASET_CARLA_TIMEOUT_S` | `30.0` | RPC call timeout |
+| `DATASET_CARLA_READY_TIMEOUT_S` | `180.0` | How long to wait for the server to become ready |
+| `DATASET_TRAFFIC_MANAGER_PORT` | CARLA default | Traffic Manager port |
+
+### Scene & traffic
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DATASET_TARGET_CAR_COUNT` | `30` | Vehicles to spawn |
 | `DATASET_PEDESTRIAN_COUNT` | `30` | Pedestrians to spawn |
-| `DATASET_CAPTURE_BASE_DIR` | `Scripts/DatasetCreation` | Parent directory for `sensor_capture_*` folders |
-| `DATASET_KEEP_SENSORS_RUNNING` | `0` (set to `1` in test mode) | Keeps radar setup alive when sharing a console |
-| `DATASET_AUTOMATIC_TRAFFIC_LIGHTS` | `0` | `1` = unfreeze all lights; `0` = perimeter cycling (recommended) |
+| `DATASET_SPAWN_CENTER_INDEX` | `144` | Spawn-point index used as the corridor center |
+| `DATASET_SPAWN_RADIUS_M` | `80.0` | Outer spawn radius |
+| `DATASET_SPAWN_EXCLUSION_RADIUS_M` | `0.0` | Inner no-spawn radius (drive-in zone) |
+| `DATASET_VEHICLE_SPEED_REDUCTION_PCT` | `-100.0` | % slower than limit (negative = faster) |
+| `DATASET_SAFE_FOLLOWING_DISTANCE_M` | `3.0` | Traffic-manager following distance |
+| `DATASET_FREE_VEHICLE_DRIVING` | `1` | `1` = drive, `0` = parked |
+| `DATASET_KEEP_TRAFFIC_RUNNING` | `0` | Keep spawned vehicles after the script exits |
+| `DATASET_KEEP_PEDESTRIANS_RUNNING` | `0` | Keep pedestrians after exit |
+| `DATASET_KEEP_SENSORS_RUNNING` | `0` (test sets `1`) | Keep sensors alive when sharing a console |
+
+### Traffic lights
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DATASET_AUTOMATIC_TRAFFIC_LIGHTS` | `0` | `1` = unfreeze all lights; `0` = perimeter cycling |
+| `DATASET_TRAFFIC_LIGHT_GUI_AUTOCONNECT` | `0` | Auto-connect the light-control GUI |
+
+### Radar sensor
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DATASET_EXPECTED_RADAR_COUNT` | `12` (set by `Start.py`) | Number of radar labels `R1…Rn` |
+| `DATASET_RADAR_POINTS_PER_SECOND` | `15000` | Ray density per radar (clamped ≤ 20000) |
+| `DATASET_RADAR_HORIZONTAL_FOV_DEG` | `120.0` | Horizontal FOV |
+| `DATASET_RADAR_VERTICAL_FOV_DEG` | `60.0` | Vertical FOV |
+| `DATASET_RADAR_SENSOR_TICK_S` | `0.05` | Per-sensor tick (≈20 Hz; `0` = every sim step) |
+| `DATASET_RADAR_PITCH_DEG` | layout default | Per-radar downward pitch override |
+
+### Capture pipeline
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DATASET_CAPTURE_BASE_DIR` | `DatasetCreation/` | Parent dir for `sensor_capture_*` |
+| `DATASET_RADAR_CAPTURE_FAST` | `1` | Fast capture (logs `actor_frames.jsonl`, labels offline after stop) |
+| `DATASET_LABEL_RADAR_AFTER_CAPTURE` | `1` | Run offline labeling automatically when capture stops |
+| `DATASET_RADAR_LABEL_WORKERS` | `4` | Worker threads for in-line labeling |
+| `DATASET_RADAR_PER_SENSOR_LATEST` | `0` | Keep only the latest message per sensor (drop backlog) |
+| `DATASET_SYNC_MODE` | `0` | `1` = synchronous CARLA mode |
+| `DATASET_SYNC_FIXED_DELTA_S` | auto | Fixed sim step when synchronous |
+| `DATASET_RADAR_QUEUE_MAXSIZE` / `DATASET_RADAR_CAPTURE_DEQUE_MAX` / `DATASET_RADAR_WATCHDOG_STALE_TICKS` | tuned | Advanced queue / backpressure / stall-watchdog knobs |
+
+### Radar labeling & match margin
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DATASET_RADAR_HIT_MATCH_MAX_MARGIN_M` | `0.5` | Primary accept margin (m), clamp `0.5–25` |
+| `DATASET_RADAR_SINGLE_CANDIDATE_MAX_MARGIN_M` | `1.0` | Single-candidate fallback margin (m), clamp `0.5–25` |
+| `DATASET_RADAR_CANDIDATE_HIT_MAX_BBOX_MARGIN_M` | `7.0` | Candidate pre-filter radius (m) |
+| `DATASET_LABELABLE_MIN_SPEED_MPS` | `0.0` | Min `|velocity|` to score a return |
+| `DATASET_RADAR_AUTO_MARGIN` | `0` | `1` = derive the margin from this capture's distribution |
+| `DATASET_RADAR_AUTO_MARGIN_STRIDE` | `20` | Frame sampling stride for `--auto-margin` |
 
 ---
 
 ## Troubleshooting
 
-**`Could not connect to CARLA` / connection timeout**
+**`No module named 'carla'`** — activate the venv and `pip install carla==0.9.16`; use the same Python for every script.
 
-- Start `CarlaUE4.exe` first and wait for the main window.
-- Confirm nothing else is using port **2000**.
-- Run `python PythonAPI\util\test_connection.py` from the activated venv.
+**`Could not connect to CARLA` / timeout** — make sure the server is up and listening on `:2000` (`ss -lntp | grep 2000`); `run_sim.sh` starts and waits for it automatically.
 
-**`No module named 'carla'`**
+**`No tagged dataset sensors found`** — run a `setup/RadarCameraSetup*.py` (or full `Start.py`) before capturing; in test mode allow ~12 s for sensors to spawn.
 
-- Activate `.venv` and run `pip install carla==0.9.16`.
-- Use the **same** `python.exe` for all scripts (the venv under this project root).
+**Wrong map / sensors in odd places** — load `Town10HD_Opt` first; the bundled extrinsics only match this map.
 
-**`No tagged dataset sensors found`**
+**Half my returns look like clutter** — open `radar_labeling_qa/radar_labeling_summary.png` and check the margin panel; lower the margin toward the trough, or re-label with `--auto-margin`.
 
-- Run a `RadarCameraSetup*.py` script (or full `Start.py`) before `CaptureRadarCameraData.py`.
-- Wait at least ~12 seconds after setup in test mode for sensors to spawn.
-
-**Wrong map / sensors in odd places**
-
-- Load **`Town10HD_Opt`** before starting the pipeline.
-
-**Extrinsic files missing after stop**
-
-- In full mode, stop with **Ctrl+C** from `Start.py` (not by killing CARLA first).
-- Keep CARLA and sensor scripts alive until export messages appear.
-
-**Traffic Light GUI does not appear**
-
-- On Windows, `TrafficLightControl.py` opens in a **second console**; check the taskbar for another terminal window.
-
----
-
-## Project layout (short)
-
-```
-CARLA_Latest/
-├── CarlaUE4.exe          # Start this first
-├── PythonAPI/            # Upstream CARLA examples and utilities
-├── Scripts/
-│   └── DatasetCreation/  # Pipeline scripts (Start.py lives here)
-│       ├── Start.py
-│       ├── CaptureRadarCameraData.py
-│       ├── RadarCameraSetup{4,8,12,14}.py
-│       └── requirements.txt
-└── .venv/                # Python environment (create locally)
-```
+**Extrinsics missing after stop** — stop a full run with Ctrl+C from `Start.py` (not by killing CARLA first); keep CARLA alive until export messages appear.
 
 ---
 
 ## Further reading
 
-- Upstream CARLA docs: [https://carla.readthedocs.io](https://carla.readthedocs.io)
-- Stock simulator readme: [README](README)
-- CARLA 0.9.16 release notes: [CHANGELOG](CHANGELOG)
+- CARLA docs: <https://carla.readthedocs.io>
+- CARLA 0.9.16 release: <https://github.com/carla-simulator/carla/releases/tag/0.9.16>

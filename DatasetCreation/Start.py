@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -92,7 +93,7 @@ def prompt_radar_count() -> int:
     allowed = frozenset({4, 8, 12, 14})
     menu = {"1": 4, "2": 8, "3": 12}
     while True:
-        choice = input("Choice (default 1): ").strip() or "1"
+        choice = input("Choice (default 2 -> 8 radars): ").strip() or "2"
         try:
             n = int(choice)
         except ValueError:
@@ -338,32 +339,94 @@ def print_test_labeling_summaries(out_dir: Path) -> None:
     print("=" * 60 + "\n", flush=True)
 
 
+def _on_term_signal(signum, frame):
+    """Make SIGTERM behave like Ctrl+C so a single per-PID signal to this process
+    triggers the graceful shutdown handler (reliable even for background launches,
+    where Ctrl+C can't be delivered to the whole process group)."""
+    raise KeyboardInterrupt
+
+
 def stop_all(processes: list[subprocess.Popen], timeout_s: float = 5.0) -> None:
-    """Stop all started child scripts."""
+    """Stop child scripts, letting each run its own cleanup first.
+
+    SIGINT is sent before terminate()/kill() so every script hits its
+    KeyboardInterrupt/finally path and destroys the actors it spawned (radars,
+    walkers, ...). Plain terminate() (SIGTERM) skips those finally blocks, which is
+    what kept orphaning dataset radars in the world across runs.
+    """
     if not processes:
         return
 
     print("\nStopping all scripts...")
 
+    # 1) Graceful: SIGINT → each script's finally destroys its actors.
     for process in processes:
         if process.poll() is None:
-            process.terminate()
-
+            try:
+                process.send_signal(signal.SIGINT)
+            except (ProcessLookupError, OSError):
+                pass
     for process in processes:
-        if process.poll() is not None:
-            continue
-        try:
-            process.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            pass
+        if process.poll() is None:
+            try:
+                process.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                pass
 
+    # 2) Escalate: terminate() anything that ignored SIGINT.
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                pass
+
+    # 3) Last resort: SIGKILL.
     for process in processes:
         if process.poll() is None:
             print(f"  - Force killing PID {process.pid}")
-            process.kill()
-            process.wait()
+            try:
+                process.kill()
+                process.wait()
+            except OSError:
+                pass
 
     print("All scripts stopped.")
+
+
+def destroy_leftover_dataset_sensors(dc_root: Path) -> None:
+    """Belt-and-suspenders world cleanup: destroy any dataset_radar_* / dataset_camera_*
+    sensors still present after the child scripts stopped, so the world is left clean
+    even if a setup script was force-killed before its own finally ran."""
+    try:
+        from carla_connect import get_world
+
+        _, world = get_world()
+        killed = 0
+        for actor in world.get_actors():
+            if not actor.type_id.startswith("sensor."):
+                continue
+            role = actor.attributes.get("role_name", "")
+            if role.startswith("dataset_radar_") or role.startswith("dataset_camera_"):
+                try:
+                    actor.destroy()
+                    killed += 1
+                except RuntimeError:
+                    pass
+        print(
+            f"Leftover dataset sensors destroyed: {killed}."
+            if killed
+            else "World clean: no leftover dataset sensors.",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"(leftover-sensor cleanup skipped: {exc})", flush=True)
 
 
 def export_dataset_extrinsics_in_process(dc_root: Path, dataset_dir: Path | None) -> None:
@@ -571,6 +634,9 @@ def _estimate_capture_wait_s(dc_root: Path) -> float:
 
 
 def main() -> None:
+    # SIGTERM triggers the same graceful shutdown as Ctrl+C (KeyboardInterrupt) so the
+    # pipeline can be torn down reliably with a single per-PID signal to THIS process.
+    signal.signal(signal.SIGTERM, _on_term_signal)
     cli = parse_cli_args()
     dc_root = dataset_root()
     prime_imports(dc_root)
@@ -704,6 +770,13 @@ def main() -> None:
                 None,
             )
             if capture_proc is not None and capture_proc.poll() is None:
+                # Explicitly tell the capture to finalize (drain → extrinsics → offline
+                # labeling). Don't assume it already got a console Ctrl+C — under a
+                # background launch only THIS process may have been signalled.
+                try:
+                    capture_proc.send_signal(signal.SIGINT)
+                except (ProcessLookupError, OSError):
+                    pass
                 capture_wait_s = _estimate_capture_wait_s(dc_root)
                 print(
                     "\nWaiting for CaptureRadarCameraData to finish "
@@ -737,6 +810,7 @@ def main() -> None:
             # RadarCameraSetup* had already destroyed the sensors and the call failed.
             stop_all(processes)
         despawn_all_cars(dc_root)
+        destroy_leftover_dataset_sensors(dc_root)
 
 
 if __name__ == "__main__":

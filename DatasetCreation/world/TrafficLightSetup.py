@@ -8,6 +8,7 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_dc_entry)
 _dc_entry.bootstrap(__file__)
 
+import math
 import os
 import time
 
@@ -149,6 +150,146 @@ def automatic_traffic_lights_from_env() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def force_all_green_from_env() -> bool:
+    """When true, force EVERY traffic light to a frozen green so cars never stop at a
+    signal — they flow continuously toward and through the monitored corridor. Maximizes
+    moving-car occupancy of the corridor; the TM still avoids collisions at junctions
+    (ignore_vehicles=0). Override via DATASET_TRAFFIC_LIGHTS_ALL_GREEN."""
+    raw = os.environ.get("DATASET_TRAFFIC_LIGHTS_ALL_GREEN", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def configure_traffic_lights_all_green(world):
+    """Force all lights green + frozen so traffic never stops at a signal."""
+    lights = list(world.get_actors().filter("traffic.traffic_light*"))
+    if not lights:
+        print("No traffic lights found.")
+        return None
+    for light in lights:
+        light.set_state(carla.TrafficLightState.Green)
+        light.set_green_time(99999.0)
+        light.set_yellow_time(0.1)
+        light.set_red_time(0.1)
+        light.freeze(True)
+    print(
+        f"All traffic lights forced GREEN and frozen ({len(lights)}) — "
+        "continuous flow toward/through the corridor."
+    )
+    return None
+
+
+def green_wave_from_env() -> bool:
+    """Corridor green-wave: green every light whose movement runs ALONG the monitored
+    corridor and red the conflicting cross movements, so the corridor flows continuously
+    without the all-green junction deadlock. Override via DATASET_TRAFFIC_LIGHTS_GREEN_WAVE."""
+    raw = os.environ.get("DATASET_TRAFFIC_LIGHTS_GREEN_WAVE", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _principal_axis_yaw_deg(points):
+    """Direction (deg) of maximum spread of the points = corridor through-axis."""
+    n = len(points)
+    cx = sum(p[0] for p in points) / n
+    cy = sum(p[1] for p in points) / n
+    sxx = sum((p[0] - cx) ** 2 for p in points)
+    syy = sum((p[1] - cy) ** 2 for p in points)
+    sxy = sum((p[0] - cx) * (p[1] - cy) for p in points)
+    return math.degrees(0.5 * math.atan2(2.0 * sxy, sxx - syy))
+
+
+def _dataset_radar_xy(world):
+    return [
+        (a.get_transform().location.x, a.get_transform().location.y)
+        for a in world.get_actors().filter("sensor.other.radar")
+        if a.attributes.get("role_name", "").startswith("dataset_radar_")
+    ]
+
+
+def configure_traffic_lights_green_wave(world, align_deg=45.0):
+    """Green the corridor's through-movement, red the cross movements (a 'green wave').
+
+    A light is greened iff its controlled lanes run roughly PARALLEL to the corridor
+    axis (within ``align_deg``); otherwise it is forced red. Because only one axis
+    flows at each junction, the corridor streams continuously without the all-green
+    deadlock (where every direction goes and cars mutually block the junction box).
+
+    The corridor axis is the principal axis of the dataset radar layout (falls back to
+    the road direction at the C10 anchor if no radars are spawned yet).
+    """
+    lights = list(world.get_actors().filter("traffic.traffic_light*"))
+    if not lights:
+        print("No traffic lights found.")
+        return None
+
+    radar_xy = _dataset_radar_xy(world)
+    if len(radar_xy) >= 2:
+        corridor_yaw = _principal_axis_yaw_deg(radar_xy)
+        src = f"radar layout ({len(radar_xy)} radars)"
+    else:
+        wp = world.get_map().get_waypoint(C10_ANCHOR_LOCATION, project_to_road=True)
+        corridor_yaw = wp.transform.rotation.yaw if wp is not None else 0.0
+        src = "C10 anchor road"
+    cos_thresh = math.cos(math.radians(align_deg))
+
+    def route_feeds_corridor(wp, reach_m=25.0, step_m=4.0, max_steps=90):
+        """True if driving FORWARD from this stop waypoint reaches the radar zone.
+
+        The corridor curves north at both ends, so its drive-in approaches are NOT
+        axis-parallel — a purely orientation-based rule freezes those feeder lights
+        solid red, stalling every car that drives in along the curve (the recurring
+        'stuck at the intersection' jam). Greening any movement that actually FEEDS
+        the corridor keeps both eastbound and westbound drive-in traffic flowing."""
+        if not radar_xy:
+            return False
+        cur = wp
+        for _ in range(max_steps):
+            loc = cur.transform.location
+            if min((loc.x - rx) ** 2 + (loc.y - ry) ** 2 for rx, ry in radar_xy) <= reach_m * reach_m:
+                return True
+            nxt = cur.next(step_m)
+            if not nxt:
+                break
+            cur = nxt[0]
+        return False
+
+    n_green = n_red = n_feed = 0
+    for light in lights:
+        stop_wps = light.get_stop_waypoints()
+        if stop_wps:
+            aligns = [
+                abs(math.cos(math.radians(wp.transform.rotation.yaw - corridor_yaw)))
+                for wp in stop_wps
+            ]
+            parallel = (sum(aligns) / len(aligns)) >= cos_thresh
+        else:
+            parallel = False  # unknown movement -> treat as cross (red) to avoid conflicts
+
+        # Green = corridor through-movement OR a movement that drives into the corridor.
+        feeds = (not parallel) and any(route_feeds_corridor(wp) for wp in stop_wps)
+        if parallel or feeds:
+            light.set_state(carla.TrafficLightState.Green)
+            light.set_green_time(99999.0)
+            light.set_yellow_time(0.1)
+            light.set_red_time(0.1)
+            n_green += 1
+            n_feed += int(feeds)
+        else:
+            light.set_state(carla.TrafficLightState.Red)
+            light.set_red_time(99999.0)
+            light.set_yellow_time(0.1)
+            light.set_green_time(0.1)
+            n_red += 1
+        light.freeze(True)
+
+    print(
+        f"Green-wave traffic lights: corridor axis {corridor_yaw:+.0f}° (from {src}); "
+        f"{n_green} green ({n_green - n_feed} through + {n_feed} feeder) / "
+        f"{n_red} red (cross) of {len(lights)}.",
+        flush=True,
+    )
+    return None
+
+
 def configure_traffic_lights_free_automatic(world):
     """
     Let CARLA run the traffic-light state machine (unfreeze all lights).
@@ -245,7 +386,11 @@ def configure_traffic_lights(world, margin_m=PERIMETER_MARGIN_M):
 def main():
     _, world = get_world()
 
-    if automatic_traffic_lights_from_env():
+    if green_wave_from_env():
+        always_green_light_id = configure_traffic_lights_green_wave(world)
+    elif force_all_green_from_env():
+        always_green_light_id = configure_traffic_lights_all_green(world)
+    elif automatic_traffic_lights_from_env():
         always_green_light_id = configure_traffic_lights_free_automatic(world)
     else:
         always_green_light_id = configure_traffic_lights(

@@ -40,7 +40,13 @@ from capture.CaptureRadarCameraData import (
     radar_single_candidate_max_margin_m_from_env,
     write_capture_labeling_report,
 )
-from testing.RadarLabelingTestReport import DetectionRecord, LabelingStatsCollector
+from testing.RadarLabelingTestReport import (
+    MARGIN_N_BINS,
+    DetectionRecord,
+    LabelingStatsCollector,
+    derive_margin_threshold,
+    margin_bin_index,
+)
 
 RADAR_CSV = "radar_data.csv"
 LABELED_CSV = "radar_data_labeled.csv"
@@ -73,6 +79,66 @@ def _transform_from_row(row: dict) -> carla.Transform:
             roll=float(row["sensor_roll_deg"]),
         ),
     )
+
+
+def auto_margin_from_env() -> bool:
+    """DATASET_RADAR_AUTO_MARGIN=1 derives the match margin from this capture's own
+    nearest-margin distribution instead of using the constant/env. Default OFF so
+    dataset runs stay reproducible with a fixed, documented threshold."""
+    raw = os.environ.get("DATASET_RADAR_AUTO_MARGIN", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def auto_margin_stride_from_env() -> int:
+    raw = os.environ.get("DATASET_RADAR_AUTO_MARGIN_STRIDE", "20").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 20
+
+
+def derive_capture_margins(
+    radar_path: Path,
+    actors_by_frame: dict,
+    labelable_min_speed: float,
+    *,
+    stride: int,
+    base_primary: float,
+    base_single: float,
+) -> tuple[float, float, dict]:
+    """Sampled first pass: build the uncensored nearest-margin histogram and derive
+    a primary + single-candidate margin from its trough. The margins passed in only
+    drive matching (which we ignore here) — the histogram is threshold-independent.
+    Falls back to base_* when the sample has too few candidate returns.
+    """
+    import numpy as np
+
+    hist = np.zeros(MARGIN_N_BINS, dtype=np.int64)
+    with radar_path.open(newline="", encoding="utf-8") as rf:
+        for row in csv.DictReader(rf):
+            if int(row["frame"]) % stride:
+                continue
+            actors = actors_by_frame.get(int(row["frame"]))
+            if not actors:
+                continue
+            label = evaluate_radar_detection_label(
+                None,
+                _transform_from_row(row),
+                _detection_from_row(row),
+                actors,
+                range_m=RADAR_MAX_RANGE_M,
+                hfov_deg=RADAR_HORIZONTAL_FOV_DEG,
+                labelable_min_speed_mps=labelable_min_speed,
+                hit_match_max_margin_m=base_primary,
+                single_candidate_max_margin_m=base_single,
+            )
+            bi = margin_bin_index(label["uncensored_nearest_bbox_margin_m"])
+            if bi is not None:
+                hist[bi] += 1
+    diag = derive_margin_threshold(hist)
+    if diag["enough_data"] and diag["suggested_primary_m"] is not None:
+        return diag["suggested_primary_m"], diag["suggested_single_m"], diag
+    return base_primary, base_single, diag
 
 
 def label_radar_capture_dir(
@@ -124,6 +190,40 @@ def label_radar_capture_dir(
         f"labelable_min_speed_mps={labelable_min_speed:.2f}",
         flush=True,
     )
+
+    if auto_margin_from_env():
+        stride = auto_margin_stride_from_env()
+        print(
+            f"[auto-margin] DATASET_RADAR_AUTO_MARGIN=1: deriving margin from this "
+            f"capture (every {stride}th frame)...",
+            flush=True,
+        )
+        t_am = time.time()
+        auto_primary, auto_single, diag = derive_capture_margins(
+            radar_path,
+            actors_by_frame,
+            labelable_min_speed,
+            stride=stride,
+            base_primary=hit_match_margin,
+            base_single=single_cand_margin,
+        )
+        if diag["enough_data"] and diag["suggested_primary_m"] is not None:
+            print(
+                f"[auto-margin] samples={diag['samples']:,} "
+                f"spike={100 * diag['spike_frac']:.1f}% trough={diag['trough_m']} m "
+                f"-> primary {auto_primary} m, single {auto_single} m "
+                f"(was {hit_match_margin:.2f}/{single_cand_margin:.2f}) "
+                f"in {time.time() - t_am:.1f}s",
+                flush=True,
+            )
+            hit_match_margin, single_cand_margin = auto_primary, auto_single
+        else:
+            print(
+                f"[auto-margin] only {diag['samples']:,} candidate samples (<2000) — "
+                f"keeping {hit_match_margin:.2f}/{single_cand_margin:.2f} m",
+                flush=True,
+            )
+
     collector = LabelingStatsCollector(labelable_min_speed_mps=labelable_min_speed)
 
     rows_written = 0
@@ -214,6 +314,9 @@ def label_radar_capture_dir(
                         actor_class=label["actor_class"],
                         match_bbox_margin_m=label["match_bbox_margin_m"],
                         nearest_bbox_margin_m=label["nearest_bbox_margin_m"],
+                        uncensored_nearest_bbox_margin_m=label[
+                            "uncensored_nearest_bbox_margin_m"
+                        ],
                     )
                 )
 
@@ -294,7 +397,23 @@ def main() -> int:
         default=50_000,
         help="Print progress every N rows (0=disable)",
     )
+    parser.add_argument(
+        "--auto-margin",
+        action="store_true",
+        help="Derive the hit-match margin from this capture's own margin distribution "
+        "(sets DATASET_RADAR_AUTO_MARGIN=1) instead of the fixed 0.5/1.0 m defaults.",
+    )
+    parser.add_argument(
+        "--auto-margin-stride",
+        type=int,
+        default=None,
+        help="Sample every Nth frame when deriving --auto-margin (default 20).",
+    )
     args = parser.parse_args()
+    if args.auto_margin:
+        os.environ["DATASET_RADAR_AUTO_MARGIN"] = "1"
+    if args.auto_margin_stride is not None:
+        os.environ["DATASET_RADAR_AUTO_MARGIN_STRIDE"] = str(args.auto_margin_stride)
     try:
         out = label_radar_capture_dir(
             args.capture_dir,

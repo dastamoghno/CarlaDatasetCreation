@@ -98,11 +98,12 @@ def _aspect_delta(heading_rad: float, los_rad: float, amp: float) -> float:
 
 def _noise_sigmas(snr_db_val: float) -> tuple:
     snr_lin = max(10.0 ** (snr_db_val / 10.0), 0.01)
-    s = math.sqrt(snr_lin)
+    sqrt_2snr = math.sqrt(2.0 * snr_lin)
+    sqrt_snr  = math.sqrt(snr_lin)
     return (
-        _DR / (2.0 * s),
-        _DV / (2.0 * s),
-        max(_AZ_SIGMA_0_RAD / s, _AZ_SIGMA_FLOOR),
+        _DR / sqrt_2snr,
+        _DV / sqrt_2snr,
+        max(_AZ_SIGMA_0_RAD / sqrt_snr, _AZ_SIGMA_FLOOR),
     )
 
 
@@ -495,12 +496,13 @@ def make_plots(rows: list[dict], save_dir: Path | None) -> None:
             ax.scatter(snrs, err, s=3, alpha=0.3, color=rng_cmap[klass],
                        label=klass, marker=_class_markers[klass])
 
-    # Overlay theoretical 1-sigma envelope
+    # Overlay theoretical 1-sigma envelope (CRLB: sigma = resolution / sqrt(2*SNR))
     snr_env = np.linspace(_SNR_THRESHOLD_DB, 45, 200)
     snr_lin_env = 10.0 ** (snr_env / 10.0)
-    s_env = np.sqrt(snr_lin_env)
-    sigma_r_env = _DR / (2.0 * s_env)
-    sigma_v_env = _DV / (2.0 * s_env)
+    sqrt_2snr_env = np.sqrt(2.0 * snr_lin_env)
+    s_env         = np.sqrt(snr_lin_env)
+    sigma_r_env  = _DR / sqrt_2snr_env
+    sigma_v_env  = _DV / sqrt_2snr_env
     sigma_az_env = np.degrees(np.maximum(_AZ_SIGMA_0_RAD / s_env, _AZ_SIGMA_FLOOR))
 
     for ax, sigma_env, label in zip(axes3,

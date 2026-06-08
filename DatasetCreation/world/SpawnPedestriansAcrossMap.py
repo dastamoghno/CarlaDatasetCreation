@@ -43,6 +43,20 @@ DEFAULT_PED_SPAWN_CENTER_X = 18.45
 DEFAULT_PED_SPAWN_CENTER_Y = -63.0
 DEFAULT_PED_SPAWN_RADIUS_M = 60.0
 
+# --- Mid-block corridor crossers ------------------------------------------------
+# CARLA's navmesh AI only crosses roads at map-defined crosswalks, and the corridor
+# has exactly one (at the west junction ~(-31,-61)). To get pedestrians crossing the
+# ROAD mid-block in radar view, a subset of walkers is driven manually straight across
+# the corridor (direct WalkerControl, no AI controller), shuttling between the south
+# and north curbs at chosen x-positions. Opt-in via DATASET_PED_CROSSING_COUNT > 0;
+# those crossers are taken from the total pedestrian count (the rest roam on AI).
+DEFAULT_PED_CROSSING_COUNT = 0
+DEFAULT_PED_CROSSING_X_MIN = -25.0     # radar zone spans x ~[-29, 66]
+DEFAULT_PED_CROSSING_X_MAX = 60.0
+DEFAULT_PED_CROSSING_Y_SOUTH = -72.0   # south curb (south radars at y=-73.5)
+DEFAULT_PED_CROSSING_Y_NORTH = -54.0   # north curb (north radars at y=-52.5)
+DEFAULT_PED_CROSSING_SPEED = 1.4       # m/s; raise for joggers
+
 
 def keep_pedestrians_running() -> bool:
     """When set by Start.py, spawn once and roam until the process is stopped (no prompt)."""
@@ -62,6 +76,75 @@ def pedestrian_count_from_env(default=DEFAULT_PED_COUNT) -> int:
         return max(0, int(raw))
     except ValueError:
         return default
+
+
+def _clamped_float_from_env(name, default, lo, hi):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(lo, min(hi, float(raw)))
+    except ValueError:
+        return default
+
+
+def ped_crossing_factor_from_env() -> float:
+    """Fraction of pedestrians allowed to cross roads (set_pedestrians_cross_factor).
+
+    Raising this (e.g. 0.7-0.9 at intersection captures) is the keystone for putting
+    pedestrians onto the roadway at vehicle depths/bearings, decorrelating class from
+    position/depth. Clamped to [0, 1]; default DATASET-overridable."""
+    return _clamped_float_from_env("DATASET_PED_CROSSING_FACTOR", PED_CROSSING_FACTOR, 0.0, 1.0)
+
+
+def ped_running_fraction_from_env() -> float:
+    return _clamped_float_from_env("DATASET_PED_RUNNING_FRACTION", PED_RUNNING_FRACTION, 0.0, 1.0)
+
+
+def ped_crossing_count_from_env(default=DEFAULT_PED_CROSSING_COUNT) -> int:
+    """Number of pedestrians driven manually across the corridor mid-block (no AI).
+    Taken from the total DATASET_PEDESTRIAN_COUNT; the remainder roam on the navmesh."""
+    raw = os.environ.get("DATASET_PED_CROSSING_COUNT", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def ped_crossing_span_from_env():
+    """(x_min, x_max, y_south, y_north, speed) for the mid-block crossing band."""
+    def _f(name, default):
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+    return (
+        _f("DATASET_PED_CROSSING_X_MIN", DEFAULT_PED_CROSSING_X_MIN),
+        _f("DATASET_PED_CROSSING_X_MAX", DEFAULT_PED_CROSSING_X_MAX),
+        _f("DATASET_PED_CROSSING_Y_SOUTH", DEFAULT_PED_CROSSING_Y_SOUTH),
+        _f("DATASET_PED_CROSSING_Y_NORTH", DEFAULT_PED_CROSSING_Y_NORTH),
+        _f("DATASET_PED_CROSSING_SPEED", DEFAULT_PED_CROSSING_SPEED),
+    )
+
+
+def ped_retarget_interval_s_from_env() -> float:
+    return _clamped_float_from_env("DATASET_PED_RETARGET_INTERVAL_S", RETARGET_INTERVAL_S, 1.0, 1e6)
+
+
+def ped_seed_from_env():
+    """Seed for pedestrian RNG (reproducible spawns; recorded in run_meta). None = nondeterministic."""
+    raw = os.environ.get("DATASET_PED_SEED", os.environ.get("DATASET_SEED", "")).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def ped_spawn_region_from_env():
@@ -135,7 +218,9 @@ def spawn_pedestrians_with_ai(client, world, count):
     """
     SpawnActor = carla.command.SpawnActor
 
-    seed = random.randint(0, 0xFFFFFFFF)
+    seed = ped_seed_from_env()
+    if seed is None:
+        seed = random.randint(0, 0xFFFFFFFF)
     try:
         world.set_pedestrians_seed(seed)
     except RuntimeError:
@@ -178,7 +263,7 @@ def spawn_pedestrians_with_ai(client, world, count):
 
         if walker_bp.has_attribute("speed"):
             values = walker_bp.get_attribute("speed").recommended_values
-            if random.random() < PED_RUNNING_FRACTION and len(values) > 2:
+            if random.random() < ped_running_fraction_from_env() and len(values) > 2:
                 walker_speeds.append(values[2])
             else:
                 walker_speeds.append(values[1])
@@ -231,7 +316,7 @@ def spawn_pedestrians_with_ai(client, world, count):
 
     # 5) Crossing factor: fraction that will use crosswalks / cross streets legally.
     try:
-        world.set_pedestrians_cross_factor(PED_CROSSING_FACTOR)
+        world.set_pedestrians_cross_factor(ped_crossing_factor_from_env())
     except RuntimeError:
         pass
 
@@ -262,6 +347,100 @@ def spawn_pedestrians_with_ai(client, world, count):
         )
 
     return walkers, controllers, skipped, sync_mode
+
+
+def spawn_corridor_crossers(client, world, count):
+    """Spawn `count` walkers that march straight across the corridor mid-block, driven
+    by direct WalkerControl (no AI controller). Returns a list of state dicts
+    {walker, dir, speed} plus (y_south, y_north). Crossers alternate start side so some
+    head north and some south, and they are spread evenly across the x-band so they
+    cover the radar zone. They are made invincible so a passing vehicle doesn't ragdoll
+    them mid-crossing (TM still brakes for them) — keeps the crossing pattern stable."""
+    if count <= 0:
+        return [], (DEFAULT_PED_CROSSING_Y_SOUTH, DEFAULT_PED_CROSSING_Y_NORTH)
+
+    SpawnActor = carla.command.SpawnActor
+    bp_lib = world.get_blueprint_library()
+    walker_bps = list(bp_lib.filter("walker.pedestrian.*"))
+    if not walker_bps:
+        raise RuntimeError("No walker.pedestrian.* blueprints found.")
+
+    x_min, x_max, y_south, y_north, speed = ped_crossing_span_from_env()
+    # Ground height near the corridor centre (so walkers spawn at road level).
+    wp = world.get_map().get_waypoint(
+        carla.Location(x=(x_min + x_max) / 2.0, y=(y_south + y_north) / 2.0, z=0.0),
+        project_to_road=True,
+    )
+    base_z = (wp.transform.location.z if wp is not None else 0.0) + 1.0
+
+    batch, dirs = [], []
+    for i in range(count):
+        frac = (i + 0.5) / count
+        x = x_min + (x_max - x_min) * frac
+        start_south = (i % 2 == 0)
+        y = y_south if start_south else y_north
+        d = 1.0 if start_south else -1.0  # +y heads toward the north curb
+        bp = random.choice(walker_bps)
+        if bp.has_attribute("is_invincible"):
+            bp.set_attribute("is_invincible", "true")
+        tf = carla.Transform(
+            carla.Location(x=x, y=y, z=base_z),
+            carla.Rotation(yaw=90.0 if d > 0 else -90.0),
+        )
+        batch.append(SpawnActor(bp, tf))
+        dirs.append(d)
+
+    results = client.apply_batch_sync(batch, True)
+
+    settings = world.get_settings()
+    if bool(getattr(settings, "synchronous_mode", False)):
+        world.tick()
+    else:
+        world.wait_for_tick()
+
+    crossers = []
+    for res, d in zip(results, dirs):
+        if res.error:
+            print(f"  crosser spawn failed: {res.error}", flush=True)
+            continue
+        w = world.get_actor(res.actor_id)
+        if w is None:
+            continue
+        w.apply_control(carla.WalkerControl(direction=carla.Vector3D(0.0, d, 0.0), speed=speed))
+        crossers.append({"walker": w, "dir": d, "speed": speed})
+        loc = w.get_location()
+        print(
+            f"  crosser walker_id={w.id} at ({loc.x:.1f}, {loc.y:.1f}) "
+            f"heading={'N' if d > 0 else 'S'} speed={speed:.2f}",
+            flush=True,
+        )
+
+    print(
+        f"[ped] {len(crossers)} mid-block crossers over x=[{x_min:.0f},{x_max:.0f}], "
+        f"y=[{y_south:.0f},{y_north:.0f}] (manual WalkerControl, no AI).",
+        flush=True,
+    )
+    return crossers, (y_south, y_north)
+
+
+def update_crossers(crossers, y_south, y_north):
+    """Re-issue WalkerControl each tick; flip direction at each curb so crossers shuttle
+    back and forth across the corridor indefinitely."""
+    for c in crossers:
+        w = c["walker"]
+        try:
+            if not w.is_alive:
+                continue
+            y = w.get_location().y
+            if c["dir"] > 0 and y >= y_north:
+                c["dir"] = -1.0
+            elif c["dir"] < 0 and y <= y_south:
+                c["dir"] = 1.0
+            w.apply_control(
+                carla.WalkerControl(direction=carla.Vector3D(0.0, c["dir"], 0.0), speed=c["speed"])
+            )
+        except RuntimeError:
+            continue
 
 
 def retarget_controllers(world, controllers):
@@ -307,22 +486,36 @@ def main():
 
     client, world = get_world()
 
+    # Split the total count: a subset becomes manual mid-block corridor crossers, the
+    # rest roam on the navmesh AI.
+    crossing_count = min(ped_crossing_count_from_env(), count)
+    ai_count = count - crossing_count
+
     print(
         "Using CARLA built-in pedestrians (controller.ai.walker + navmesh).",
         flush=True,
     )
-    print(f"Spawning {count} pedestrians on navmesh locations...", flush=True)
-
-    walkers, controllers, skipped, sync_mode = spawn_pedestrians_with_ai(
-        client, world, count
-    )
-
     print(
-        f"Spawned {len(walkers)}/{count} with AI controllers "
-        f"(skipped {skipped}, crossing_factor={PED_CROSSING_FACTOR:.2f}).",
+        f"Spawning {ai_count} AI pedestrians + {crossing_count} mid-block crossers "
+        f"(total {count})...",
         flush=True,
     )
-    if not walkers:
+
+    walkers, controllers, skipped, sync_mode = spawn_pedestrians_with_ai(
+        client, world, ai_count
+    )
+
+    crossers, (cross_y_south, cross_y_north) = spawn_corridor_crossers(
+        client, world, crossing_count
+    )
+    crosser_walkers = [c["walker"] for c in crossers]
+
+    print(
+        f"Spawned {len(walkers)}/{ai_count} AI + {len(crossers)}/{crossing_count} crossers "
+        f"(skipped {skipped}, crossing_factor={ped_crossing_factor_from_env():.2f}).",
+        flush=True,
+    )
+    if not walkers and not crossers:
         return 0
 
     if keep_pedestrians_running():
@@ -338,7 +531,8 @@ def main():
             flush=True,
         )
 
-    next_retarget = time.time() + RETARGET_INTERVAL_S
+    retarget_interval_s = ped_retarget_interval_s_from_env()
+    next_retarget = time.time() + retarget_interval_s
     try:
         while True:
             if sync_mode:
@@ -346,16 +540,19 @@ def main():
             else:
                 world.wait_for_tick()
 
+            # Keep mid-block crossers shuttling across the road every tick.
+            update_crossers(crossers, cross_y_south, cross_y_north)
+
             now = time.time()
             if now >= next_retarget:
                 retarget_controllers(world, controllers)
-                next_retarget = now + RETARGET_INTERVAL_S
+                next_retarget = now + retarget_interval_s
     except KeyboardInterrupt:
         if not keep_pedestrians_running():
             print("\nCtrl+C received. Cleaning up...", flush=True)
     finally:
         if not keep_pedestrians_running():
-            destroyed = cleanup(walkers, controllers)
+            destroyed = cleanup(walkers + crosser_walkers, controllers)
             print(f"Destroyed {destroyed} actors.", flush=True)
 
     return 0
