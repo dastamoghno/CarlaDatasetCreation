@@ -8,6 +8,7 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_dc_entry)
 _dc_entry.bootstrap(__file__)
 
+import math
 import os
 import random
 import threading
@@ -22,14 +23,27 @@ from carla_connect import get_world
 # (road_id 10, ~(22.9, -60.9)) covered by the 8-radar layout. Index 14 was the
 # legacy "Position 14" zone (~(-113, -25)) — far from the radars; do not use it.
 SPAWN_CENTER_INDEX = 144
-# Only vehicles within this radius of the corridor anchor are used. 80 m keeps
-# traffic local enough to fill the corridor while giving cars room to drive.
-SPAWN_RADIUS_M = 80.0
+# Outer spawn radius (drive-in annulus upper bound). The radar corridor is ~95 m
+# long and cars must spawn >= RADAR_SPAWN_CLEARANCE_M from every radar, so the
+# nearest valid drive-in point is ~74 m out; 100 m yields ~28 approach points that
+# reach the radar FOV while staying close enough to arrive quickly. 80 m gives only
+# ~3; 150 m pushes spawns 120 m+ out (too far to arrive in a short capture).
+SPAWN_RADIUS_M = 100.0
+# Fleet size cycled through the corridor. Higher = more cars simultaneously in view;
+# the short corridor + 30 km/h can stop-and-go if pushed too far, but with the drive-in
+# spread ~30 keeps a denser stream flowing. Override via DATASET_TARGET_CAR_COUNT.
 TARGET_CAR_COUNT = 30
-# Poisson process rate (lambda): expected spawns per second.
-SPAWN_RATE_PER_SECOND = 0.5
+# Fraction of spawned vehicles that should be trucks. CARLA blueprint pools are
+# car-heavy, so without this trucks are rare (one capture had 1 distinct truck =
+# 30% of all labels — a per-actor memorization shortcut). Recirculation then yields
+# many distinct trucks over a capture. Override via DATASET_VEHICLE_TRUCK_FRACTION
+# or derive from DATASET_TARGET_TRUCK_COUNT.
+DEFAULT_TRUCK_FRACTION = 0.20
+# Poisson process rate (lambda): expected spawns per second. Higher = fleet fills
+# faster (more cars on the road sooner). Paired with the smaller MOVE_AWAY_DISTANCE_M.
+SPAWN_RATE_PER_SECOND = 1.0
 TRAFFIC_MANAGER_PORT = 8000
-MOVE_AWAY_DISTANCE_M = 8.0
+MOVE_AWAY_DISTANCE_M = 4.0   # next spawn once previous clears this far; lower = faster fill
 MOVE_AWAY_TIMEOUT_S = 30.0
 MOVE_AWAY_POLL_S = 0.25
 # Waypoints for traffic_manager.set_path (lane follow; avoids set_route "RoadOption" errors).
@@ -39,17 +53,26 @@ LANE_PATH_POINTS = 120
 FREE_DRIVING_PATH_POINTS = 300
 LANE_PATH_STEP_M = 5.0
 # ── Crash-prevention settings ───────────────────────────────────────────────
-# Minimum gap (metres) the TM keeps behind the vehicle ahead. 3 m keeps the
-# corridor flowing without long pile-ups (Town10HD default-limit roads are slow).
-SAFE_FOLLOWING_DISTANCE_M = 3.0
-# Positive → drive this % slower than the limit; NEGATIVE → faster. -100 = 2x the
-# posted limit (~60 km/h on Town10HD's signless 30 km/h corridor) so vehicles show
-# real Doppler instead of crawling. Set positive for slow/dense traffic.
-VEHICLE_SPEED_REDUCTION_PCT = -100.0
+# Minimum gap (metres) the TM keeps behind the vehicle ahead. 5 m (~0.6 s headway at
+# 30 km/h) keeps the corridor flowing; tighter packing (e.g. 3.5) just gridlocks the
+# single 30 km/h corridor instead of adding moving cars in view.
+SAFE_FOLLOWING_DISTANCE_M = 5.0
+# Positive → drive this % slower than the posted limit; NEGATIVE → faster.
+# 0 = follow the posted limit (~30 km/h on Town10HD's signless corridor). Use a
+# negative value only if you want cars to exceed the limit for stronger Doppler.
+VEHICLE_SPEED_REDUCTION_PCT = 0.0
 # ────────────────────────────────────────────────────────────────────────────
 LABEL_REFRESH_S = 0.25
 LABEL_DURATION_S = 120.0
 AUTOPILOT_MONITOR_INTERVAL_S = 2.0
+# ── Stuck recycling (recirculation) ─────────────────────────────────────────
+# A car is recycled as "stuck" only if it has not progressed for STUCK_TIMEOUT_S
+# AND is neither stopped at a red light nor queued behind another vehicle — i.e. it
+# is genuinely wedged, never merely waiting/parked. Generous timeout so normal
+# light cycles and brief jams clear on their own first.
+STUCK_TIMEOUT_S = 75.0
+STUCK_MOVE_EPS_M = 1.5          # progress < this since last checkpoint = "not moving"
+STUCK_QUEUE_AHEAD_M = 7.0       # a fleet car this close ahead = queued, not wedged
 # Drive-in mode: role prefix to find dataset radars + clearance so cars never
 # spawn inside a radar's range (avoids "pop-in"). 35 m matches RADAR_MAX_RANGE_M
 # in CaptureRadarCameraData.py; +5 m safety margin.
@@ -148,8 +171,9 @@ def get_drive_in_spawn_points(
          monitored centre — i.e. the car will actually appear in the scene we care
          about rather than driving away from it.
 
-    Returned farthest-first so cars enter from the approaches and stream through,
-    rather than popping up at the boundary.
+    Returned nearest-first so the closest valid approaches are used first and cars
+    reach the monitored zone quickly (important for short captures); farther
+    approaches fill in behind them.
     """
     center = monitored_center if monitored_center is not None else center_transform.location
     excl_sq = exclusion_radius_m * exclusion_radius_m
@@ -176,8 +200,9 @@ def get_drive_in_spawn_points(
         enters = any(distance_sq(p, center) <= excl_sq for p in path)
         if enters:
             drive_in.append(tr)
-    # Farthest-first: long approaches stream in first.
-    drive_in.sort(key=lambda tr: -distance_sq(tr.location, center))
+    # Nearest-first: closest approaches are used first so cars reach the corridor
+    # quickly (critical for short captures); farther approaches fill in behind them.
+    drive_in.sort(key=lambda tr: distance_sq(tr.location, center))
     return drive_in
 
 
@@ -226,10 +251,12 @@ def target_car_count_from_env(default=TARGET_CAR_COUNT) -> int:
         return default
 
 
-def spawn_exclusion_radius_m_from_env(default=0.0) -> float:
+def spawn_exclusion_radius_m_from_env(default=30.0) -> float:
     """Inner 'monitored zone' radius (m). When > 0, NO cars spawn inside it; they
     spawn in the annulus [exclusion, spawn_radius] and must drive in. 0 disables
-    (legacy fill-the-zone behaviour)."""
+    (legacy fill-the-zone behaviour). Default 30 m → drive-in on; note the real
+    out-of-view guarantee is RADAR_SPAWN_CLEARANCE_M (>= radar range), so this value
+    mostly controls how deep the drive-in path must reach, not where cars spawn."""
     raw = os.environ.get("DATASET_SPAWN_EXCLUSION_RADIUS_M", "").strip()
     try:
         return max(0.0, float(raw)) if raw else default
@@ -283,9 +310,9 @@ def apply_free_driving_policy(traffic_manager, actor, world_map=None, spawn_tran
     if hasattr(traffic_manager, "auto_lane_change"):
         traffic_manager.auto_lane_change(actor, True)
     if hasattr(traffic_manager, "random_left_lanechange_percentage"):
-        traffic_manager.random_left_lanechange_percentage(actor, 20.0)
+        traffic_manager.random_left_lanechange_percentage(actor, 5.0)
     if hasattr(traffic_manager, "random_right_lanechange_percentage"):
-        traffic_manager.random_right_lanechange_percentage(actor, 20.0)
+        traffic_manager.random_right_lanechange_percentage(actor, 5.0)
     if hasattr(traffic_manager, "ignore_lights_percentage"):
         traffic_manager.ignore_lights_percentage(actor, 0.0)
     if hasattr(traffic_manager, "ignore_signs_percentage"):
@@ -404,6 +431,181 @@ def monitor_autopilot_until_interrupted(
         time.sleep(poll_s)
 
 
+def _vehicle_queued_ahead(actor, loc, fleet_ids, world, ahead_m=None):
+    """True if another fleet vehicle sits close ahead of ``actor`` — i.e. it is queued
+    in traffic, not wedged on geometry. Used to NOT recycle cars waiting behind others."""
+    ahead_m = STUCK_QUEUE_AHEAD_M if ahead_m is None else ahead_m
+    try:
+        yaw = math.radians(actor.get_transform().rotation.yaw)
+    except RuntimeError:
+        return False
+    fx, fy = math.cos(yaw), math.sin(yaw)
+    ahead_sq = ahead_m * ahead_m
+    for other in world.get_actors(fleet_ids):
+        if other.id == actor.id:
+            continue
+        try:
+            if not other.is_alive:
+                continue
+            ol = other.get_location()
+        except RuntimeError:
+            continue
+        dx, dy = ol.x - loc.x, ol.y - loc.y
+        if (dx * dx + dy * dy) <= ahead_sq and (dx * fx + dy * fy) > 0.0:
+            return True
+    return False
+
+
+def _car_is_wedged(actor, loc, now, last_progress, fleet_ids, world):
+    """True only if the car is genuinely stuck (wedged) — NOT if it is legitimately
+    waiting: stopped at a red light, parked at one, or queued behind another vehicle.
+    In those cases the progress timer is refreshed so the car is never recycled.
+
+    ``last_progress`` maps actor_id -> (x, y, t_last_progress) and is mutated here.
+    """
+    aid = actor.id
+    prev = last_progress.get(aid)
+    moved_sq = 0.0 if prev is None else (loc.x - prev[0]) ** 2 + (loc.y - prev[1]) ** 2
+    if prev is None or moved_sq >= STUCK_MOVE_EPS_M ** 2:
+        last_progress[aid] = (loc.x, loc.y, now)   # made progress → reset timer
+        return False
+    # Stationary. Refresh the timer for legitimate waits so they never count as stuck.
+    try:
+        if actor.is_at_traffic_light() and (
+            actor.get_traffic_light_state() == carla.TrafficLightState.Red
+        ):
+            last_progress[aid] = (loc.x, loc.y, now)   # waiting at red light
+            return False
+    except (RuntimeError, AttributeError):
+        pass
+    if _vehicle_queued_ahead(actor, loc, fleet_ids, world):
+        last_progress[aid] = (loc.x, loc.y, now)       # queued behind traffic
+        return False
+    # Genuinely stationary, alone, not at a red light → stuck iff it has lasted long.
+    return (now - prev[2]) >= STUCK_TIMEOUT_S
+
+
+def corridor_lane_spawn_points(
+    world_map,
+    center_location,
+    radar_positions,
+    *,
+    clearance_m,
+    per_lane=8,
+    spacing_m=12.0,
+    step_m=4.0,
+    max_back_m=160.0,
+    reach_m=25.0,
+    max_forward_m=200.0,
+    return_directions=False,
+):
+    """Spawn transforms feeding the monitored corridor in BOTH travel directions,
+    placed on each lane's approach just outside the radar clearance so cars drive
+    THROUGH the radar zone.
+
+    For every driving lane on the corridor road (both directions) we walk UPSTREAM
+    (against travel) along the *straightest* route — at junction forks we follow the
+    branch whose heading bends least, so we ride the corridor's natural approach
+    (which may legitimately leave road 10 onto a connecting road for eastbound, or
+    curve north for westbound) instead of turning onto a cross street. A spawn point
+    is kept only when, walking FORWARD from it, the straightest route actually
+    re-enters the radar zone (comes within ``reach_m`` of a radar). Direction
+    (eastbound/westbound) is read from the travel heading at the closest approach to
+    the corridor centre, so it is robust to curved approaches.
+
+    With ``return_directions=True`` returns ``(transforms, dirs)`` where ``dirs[i]``
+    is ``"E"`` or ``"W"``; otherwise returns just the transform list.
+    """
+    wp0 = world_map.get_waypoint(
+        center_location, project_to_road=True, lane_type=carla.LaneType.Driving
+    )
+    if wp0 is None:
+        return ([], []) if return_directions else []
+    cx, cy = center_location.x, center_location.y
+    # All driving lanes on the corridor road (both directions) via left/right neighbours.
+    lanes, seen = [], set()
+    cur = wp0
+    while cur is not None and cur.lane_id not in seen and cur.lane_type == carla.LaneType.Driving:
+        seen.add(cur.lane_id); lanes.append(cur); cur = cur.get_left_lane()
+    cur = wp0.get_right_lane()
+    while cur is not None and cur.lane_id not in seen and cur.lane_type == carla.LaneType.Driving:
+        seen.add(cur.lane_id); lanes.append(cur); cur = cur.get_right_lane()
+
+    clr_sq = clearance_m * clearance_m
+    reach_sq = reach_m * reach_m
+
+    def clear_of_radars(loc):
+        if not radar_positions:
+            return True
+        return all((loc.x - rx) ** 2 + (loc.y - ry) ** 2 >= clr_sq for rx, ry in radar_positions)
+
+    def straightest(cands, ref_yaw):
+        """Pick the branch whose heading bends least from ref_yaw, preferring
+        non-junction branches so we ride the through-route, not a turn."""
+        if not cands:
+            return None
+        def cost(w):
+            d = abs((w.transform.rotation.yaw - ref_yaw + 180.0) % 360.0 - 180.0)
+            return d + (90.0 if w.is_junction else 0.0)
+        return min(cands, key=cost)
+
+    def forward_probe(wp):
+        """Walk FORWARD (straightest) from wp; return (reaches_zone, dir) where dir
+        is 'E'/'W' from the travel heading nearest the corridor centre, or None."""
+        cur = wp
+        steps = int(max_forward_m / step_m)
+        best_d2 = None
+        best_yaw = None
+        reached = False
+        for _ in range(steps):
+            loc = cur.transform.location
+            for rx, ry in (radar_positions or [(cx, cy)]):
+                if (loc.x - rx) ** 2 + (loc.y - ry) ** 2 <= reach_sq:
+                    reached = True
+                    break
+            d2 = (loc.x - cx) ** 2 + (loc.y - cy) ** 2
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2; best_yaw = cur.transform.rotation.yaw
+            nxt = straightest(cur.next(step_m), cur.transform.rotation.yaw)
+            if nxt is None:
+                break
+            cur = nxt
+        if best_yaw is None:
+            return False, None
+        direction = "E" if math.cos(math.radians(best_yaw)) >= 0.0 else "W"
+        return reached, direction
+
+    skip = max(1, int(round(spacing_m / step_m)))
+    nmax = int(max_back_m / step_m)
+    out, dirs = [], []
+    for lane in lanes:
+        cur, got, i = lane, 0, 0
+        while i < nmax and got < per_lane:
+            loc = cur.transform.location
+            steps = 1
+            if not cur.is_junction and clear_of_radars(loc):
+                reaches, direction = forward_probe(cur)
+                if reaches and direction is not None:
+                    out.append(
+                        carla.Transform(
+                            carla.Location(loc.x, loc.y, loc.z + 0.5), cur.transform.rotation
+                        )
+                    )
+                    dirs.append(direction)
+                    got += 1
+                    steps = skip
+            moved = False
+            for _ in range(steps):
+                prevs = cur.previous(step_m)  # walk UPSTREAM toward the approach
+                nxt = straightest(prevs, cur.transform.rotation.yaw)
+                if nxt is None:
+                    break
+                cur = nxt; i += 1; moved = True
+            if not moved:
+                break
+    return (out, dirs) if return_directions else out
+
+
 def recirculate_traffic_until_interrupted(
     traffic_manager_port,
     spawned_ids,
@@ -427,6 +629,8 @@ def recirculate_traffic_until_interrupted(
     world_map = world.get_map()
     traffic_manager = client.get_trafficmanager(traffic_manager_port)
     vehicle_bps = get_vehicle_blueprints(world)
+    truck_bps, nontruck_bps = split_truck_bps(vehicle_bps)
+    truck_fraction = truck_fraction_from_env()
 
     spawn_points = world_map.get_spawn_points()
     center_location = spawn_points[center_index].location
@@ -435,16 +639,25 @@ def recirculate_traffic_until_interrupted(
     # Recycle a car once it is well past the spawn annulus (driven out the far side).
     recycle_radius_m = outer_radius_m + 20.0
     recycle_sq = recycle_radius_m * recycle_radius_m
+    last_progress = {}  # actor_id -> (x, y, t_last_progress); for stuck detection
+    max_dwell_s = actor_max_dwell_s_from_env()
+    spawn_time = {aid: time.time() for aid in spawned_ids}  # actor_id -> first-seen t
 
-    drive_in_points = get_drive_in_spawn_points(
-        world_map,
-        spawn_points,
-        spawn_points[center_index],
-        exclusion_radius_m=exclusion_radius_m,
-        outer_radius_m=outer_radius_m,
-        radar_positions=get_radar_positions(world),
-        radar_clearance_m=RADAR_SPAWN_CLEARANCE_M,
+    # Both-direction respawn pool: corridor lanes (E + W), straight through the zone.
+    drive_in_points = corridor_lane_spawn_points(
+        world_map, spawn_points[center_index].location, get_radar_positions(world),
+        clearance_m=RADAR_SPAWN_CLEARANCE_M,
     )
+    if not drive_in_points:
+        drive_in_points = get_drive_in_spawn_points(
+            world_map,
+            spawn_points,
+            spawn_points[center_index],
+            exclusion_radius_m=exclusion_radius_m,
+            outer_radius_m=outer_radius_m,
+            radar_positions=get_radar_positions(world),
+            radar_clearance_m=RADAR_SPAWN_CLEARANCE_M,
+        )
     if not drive_in_points:
         print("Recirculation: no drive-in points; falling back to plain autopilot monitor.",
               flush=True)
@@ -460,20 +673,36 @@ def recirculate_traffic_until_interrupted(
 
     recycle_count = 0
     while True:
+        now = time.time()
         for idx, actor_id in enumerate(list(spawned_ids)):
             try:
                 actor = world.get_actor(actor_id)
                 needs_recycle = actor is None or not actor.is_alive
+                spawn_time.setdefault(actor_id, now)
                 if not needs_recycle:
                     loc = actor.get_location()
                     if distance_sq(loc, center_location) > recycle_sq:
+                        # Drove out the far side of the corridor.
                         needs_recycle = True
+                    elif max_dwell_s and (now - spawn_time.get(actor_id, now)) > max_dwell_s:
+                        # Dwell cap: cycle this actor so no single id dominates labels.
+                        needs_recycle = True
+                    elif _car_is_wedged(actor, loc, now, last_progress, spawned_ids, world):
+                        # Genuinely wedged — NOT a red-light / queued / parked wait.
+                        needs_recycle = True
+                        print(
+                            f"  [recirculation] car {actor_id} wedged "
+                            f">{STUCK_TIMEOUT_S:.0f}s (not at light/queue); recycling",
+                            flush=True,
+                        )
                 if not needs_recycle:
                     # Keep autopilot + policy fresh.
                     actor.set_autopilot(True, traffic_manager_port)
                     if free_vehicle_driving_from_env():
                         apply_free_driving_policy(traffic_manager, actor)
                     continue
+                last_progress.pop(actor_id, None)  # forget recycled/dead id
+                spawn_time.pop(actor_id, None)
 
                 # Destroy the drifted/dead car.
                 if actor is not None and actor.is_alive:
@@ -485,7 +714,7 @@ def recirculate_traffic_until_interrupted(
                 # Respawn at a random drive-in point (retry a few collisions).
                 new_actor = None
                 for transform in random.sample(drive_in_points, min(len(drive_in_points), 8)):
-                    bp = random.choice(vehicle_bps)
+                    bp = pick_vehicle_bp(truck_bps, nontruck_bps, truck_fraction)
                     if bp.has_attribute("color"):
                         bp.set_attribute(
                             "color",
@@ -513,6 +742,7 @@ def recirculate_traffic_until_interrupted(
                         break
                 if new_actor is not None:
                     spawned_ids[idx] = new_actor.id
+                    spawn_time[new_actor.id] = now
                     recycle_count += 1
                     if recycle_count % 10 == 0:
                         print(f"  [recirculation] {recycle_count} cars recycled", flush=True)
@@ -536,6 +766,67 @@ def get_vehicle_blueprints(world):
     if not usable:
         raise RuntimeError("No usable 4-wheel vehicle blueprints found.")
     return usable
+
+
+def _bp_is_truck(bp) -> bool:
+    """Truck/large-vehicle blueprint? Mirrors capture.vehicle_class_from_type_id."""
+    tid = bp.id.lower()
+    return any(tok in tid for tok in ("firetruck", "ambulance", "truck", "carlacola"))
+
+
+def split_truck_bps(vehicle_bps):
+    """Partition a blueprint list into (truck_bps, nontruck_bps)."""
+    truck = [bp for bp in vehicle_bps if _bp_is_truck(bp)]
+    nontruck = [bp for bp in vehicle_bps if not _bp_is_truck(bp)]
+    return truck, nontruck
+
+
+def truck_fraction_from_env(default=DEFAULT_TRUCK_FRACTION) -> float:
+    """Target truck fraction. DATASET_VEHICLE_TRUCK_FRACTION wins; else derived from
+    DATASET_TARGET_TRUCK_COUNT vs the (total) fleet count; else the default."""
+    raw = os.environ.get("DATASET_VEHICLE_TRUCK_FRACTION", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError:
+            pass
+    tc = os.environ.get("DATASET_TARGET_TRUCK_COUNT", "").strip()
+    if tc:
+        try:
+            t = max(0, int(tc))
+            total = max(1, target_car_count_from_env())
+            return max(0.0, min(1.0, t / total))
+        except ValueError:
+            pass
+    return default
+
+
+def pick_vehicle_bp(truck_bps, nontruck_bps, truck_fraction):
+    """Sample a blueprint, biasing toward trucks with probability truck_fraction.
+
+    Used at both initial fill and recirculation so the realized car:truck mix
+    (and the number of distinct trucks over a capture) matches the target."""
+    if truck_bps and nontruck_bps:
+        if random.random() < truck_fraction:
+            return random.choice(truck_bps)
+        return random.choice(nontruck_bps)
+    return random.choice(truck_bps or nontruck_bps)
+
+
+def actor_max_dwell_s_from_env(default=0.0) -> float:
+    """Force-recycle any fleet vehicle alive longer than this many seconds.
+
+    Caps how many radar points a single actor can accumulate so no instance
+    dominates the labels (one capture had a single truck = 30% of all points).
+    0 / unset = disabled (legacy behavior). The campaign sets ~25 s."""
+    raw = os.environ.get("DATASET_ACTOR_MAX_DWELL_S", "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else 0.0
 
 
 def try_spawn_cars(
@@ -567,27 +858,45 @@ def try_spawn_cars(
     if exclusion_radius_m > 0.0:
         # Spawn-outside, drive-in: no cars inside the monitored zone; they enter it.
         radar_positions = get_radar_positions(world)
-        candidate_points = get_drive_in_spawn_points(
-            world_map,
-            spawn_points,
-            center_transform,
-            exclusion_radius_m=exclusion_radius_m,
-            outer_radius_m=spawn_radius_m,
-            radar_positions=radar_positions,
-            radar_clearance_m=RADAR_SPAWN_CLEARANCE_M,
+        # Both-direction feed: spawn on the corridor road's own lanes (E + W) just
+        # outside radar clearance so cars drive STRAIGHT through the monitored zone.
+        candidate_points, candidate_dirs = corridor_lane_spawn_points(
+            world_map, center_transform.location, radar_positions,
+            clearance_m=RADAR_SPAWN_CLEARANCE_M, return_directions=True,
         )
+        # Shuffle points + their direction labels together so the initial fill mixes
+        # directions but the labels stay aligned to their transforms.
+        _paired = list(zip(candidate_points, candidate_dirs))
+        random.shuffle(_paired)
+        candidate_points = [p for p, _ in _paired]
+        candidate_dirs = [d for _, d in _paired]
+        if not candidate_points:
+            # Fallback: generic annulus drive-in if the corridor road can't be walked.
+            candidate_points = get_drive_in_spawn_points(
+                world_map,
+                spawn_points,
+                center_transform,
+                exclusion_radius_m=exclusion_radius_m,
+                outer_radius_m=spawn_radius_m,
+                radar_positions=radar_positions,
+                radar_clearance_m=RADAR_SPAWN_CLEARANCE_M,
+            )
+            candidate_dirs = []  # generic fallback has no verified direction labels
         if not candidate_points:
             raise RuntimeError(
-                f"No drive-in spawn points found in annulus "
+                f"No drive-in spawn points found for the corridor or the annulus "
                 f"[{exclusion_radius_m:.0f}, {spawn_radius_m:.0f}] m of spawn index "
-                f"{center_index} whose lane path enters the monitored zone. "
-                "Widen SPAWN_RADIUS_M or lower SPAWN_EXCLUSION_RADIUS_M."
+                f"{center_index}. Widen SPAWN_RADIUS_M or lower SPAWN_EXCLUSION_RADIUS_M."
             )
+        if candidate_dirs:
+            _eb = sum(1 for d in candidate_dirs if d == "E")
+            _dir_str = f"eastbound={_eb}, westbound={len(candidate_dirs) - _eb}"
+        else:
+            _dir_str = "generic fallback (no direction labels)"
         print(
-            f"Spawn mode: DRIVE-IN | monitored centre index={center_index} "
+            f"Spawn mode: DRIVE-IN (corridor both-way) | centre index={center_index} "
             f"({center_transform.location.x:.1f}, {center_transform.location.y:.1f}) | "
-            f"spawn annulus [{exclusion_radius_m:.0f}, {spawn_radius_m:.0f}] m | "
-            f"drive-in candidates={len(candidate_points)}",
+            f"candidates={len(candidate_points)} ({_dir_str})",
             flush=True,
         )
     else:
@@ -606,6 +915,8 @@ def try_spawn_cars(
         )
 
     vehicle_bps = get_vehicle_blueprints(world)
+    truck_bps, nontruck_bps = split_truck_bps(vehicle_bps)
+    truck_fraction = truck_fraction_from_env()
     spawned_ids = []
     labeled_actors = []
 
@@ -617,7 +928,7 @@ def try_spawn_cars(
         delay_s = random.expovariate(spawn_rate_per_second)
         time.sleep(delay_s)
 
-        bp = random.choice(vehicle_bps)
+        bp = pick_vehicle_bp(truck_bps, nontruck_bps, truck_fraction)
         if bp.has_attribute("color"):
             color = random.choice(bp.get_attribute("color").recommended_values)
             bp.set_attribute("color", color)
