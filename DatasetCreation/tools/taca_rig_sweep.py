@@ -36,6 +36,52 @@ def _spearman(a, b):
     return float((ra * rb).sum() / denom) if denom > 0 else float("nan")
 
 
+def _wrap_rad(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def corridor_points(radars, res=2.0, margin=2.0):
+    """Grid of candidate target locations over the road band between the radar rows."""
+    xs = np.array([r.x for r in radars]); ys = np.array([r.y for r in radars])
+    x = np.arange(xs.min(), xs.max() + res, res)
+    y0, y1 = ys.min() + margin, ys.max() - margin
+    y = np.arange(y0, y1 + res, res) if y1 > y0 else np.array([(ys.min() + ys.max()) / 2])
+    X, Y = np.meshgrid(x, y)
+    return np.column_stack([X.ravel(), Y.ravel()])
+
+
+def reaim_convergent(radars, focal):
+    """Re-aim every radar's boresight at a shared focal point (x, y)."""
+    fx, fy = focal
+    return [Radar(r.radar_id, r.x, r.y, float(np.degrees(np.arctan2(fy - r.y, fx - r.x))))
+            for r in radars]
+
+
+def coverage_and_ambiguity(radars, R_max, hfov_deg, pts, tau_lo=0.30, tau_hi=0.70):
+    """Per candidate target point: how many radars cover it (range+FoV), and whether the
+    radial-velocity signal is *ambiguous-but-reconcilable* — i.e. for a given motion
+    direction at least one covering radar sees it ~tangentially (radial frac < tau_lo, looks
+    static) AND another sees it ~radially (> tau_hi, clearly moving). That is exactly the
+    cross-sensor case naive concatenation cannot resolve but a geometry-aware fuser can.
+    Motion dirs: along-road (x) for vehicles, across-road (y) for crossers."""
+    rx = np.array([r.x for r in radars]); ry = np.array([r.y for r in radars])
+    rphi = np.radians([r.phi_deg for r in radars]); half = hfov_deg / 2.0
+    covis = np.zeros(len(pts), int)
+    info_along = np.zeros(len(pts), bool); info_across = np.zeros(len(pts), bool)
+    for i, (px, py) in enumerate(pts):
+        dx = px - rx; dy = py - ry; dist = np.hypot(dx, dy)
+        off = np.abs(np.degrees(_wrap_rad(np.arctan2(dy, dx) - rphi)))
+        cov = (dist <= R_max) & (off <= half)
+        nc = int(cov.sum()); covis[i] = nc
+        if nc >= 2:
+            losx = dx[cov] / dist[cov]; losy = dy[cov] / dist[cov]
+            for m, arr in (((1.0, 0.0), info_along), ((0.0, 1.0), info_across)):
+                rf = np.abs(losx * m[0] + losy * m[1])
+                if (rf < tau_lo).any() and (rf > tau_hi).any():
+                    arr[i] = True
+    return covis, info_along, info_across
+
+
 def analyse_rig(radars, R_max, fov_half, theta3db, target_mass):
     xs = np.array([r.x for r in radars]); ys = np.array([r.y for r in radars])
     bev = (xs.min() - R_max, xs.max() + R_max, ys.min() - R_max, ys.max() + R_max)
@@ -122,6 +168,50 @@ def analyse_rig(radars, R_max, fov_half, theta3db, target_mass):
     }
 
 
+def _layout_radars(layouts, k):
+    return [Radar(r["sensor_label"], r["x_m"], r["y_m"], r["yaw_deg"]) for r in layouts[k]]
+
+
+def coverage_section(layouts, hfov, rmax_list, aim="toward-road", focal=None,
+                     target_cov3=0.6, target_topo=0.5):
+    print("\n" + "=" * 82)
+    print("CO-VISIBILITY + RADIAL-VELOCITY AMBIGUITY (geometry only; road-band targets)")
+    print("  cov>=k  = % of road points seen by >=k radars (the fusion material)")
+    print("  topo-info = % where motion is tangential-to-one / radial-to-another radar")
+    print("              -> single-radar Doppler is ambiguous; only geometry-aware cross-")
+    print("                 sensor fusion resolves it. THIS is what naive concat can't do.")
+    print(f"  aim={aim}   PASS = cov>=3 >= {target_cov3:.0%}  AND  max(topo) >= {target_topo:.0%}")
+    print("=" * 82)
+    print(f"  {'M':>2} {'R_max':>5}  {'cov>=1':>7} {'cov>=2':>7} {'cov>=3':>7}  "
+          f"{'topo(along)':>12} {'topo(across)':>13}  {'PASS':>5}")
+    for k in sorted(layouts, key=int):
+        radars0 = _layout_radars(layouts, k)
+        if aim == "convergent":
+            fx = focal[0] if focal else float(np.mean([r.x for r in radars0]))
+            fy = focal[1] if focal else float(np.mean([r.y for r in radars0]))
+            radars = reaim_convergent(radars0, (fx, fy))
+        else:
+            radars = radars0
+        pts = corridor_points(radars0)   # road band is fixed by the rig footprint, not the aim
+        for R in rmax_list:
+            covis, ia, ic = coverage_and_ambiguity(radars, R, hfov, pts)
+            c3 = np.mean(covis >= 3); topo = max(np.mean(ia), np.mean(ic))
+            ok = "PASS" if (c3 >= target_cov3 and topo >= target_topo) else "  -"
+            print(f"  {len(radars):>2} {R:>5.0f}  {100*np.mean(covis>=1):>6.1f}% "
+                  f"{100*np.mean(covis>=2):>6.1f}% {100*c3:>6.1f}%  "
+                  f"{100*np.mean(ia):>11.1f}% {100*np.mean(ic):>12.1f}%  {ok:>5}")
+
+    # Always-on aim sensitivity check (toward-road vs convergent) on the largest rig at R=50.
+    big = max(layouts, key=int); radars0 = _layout_radars(layouts, big)
+    cx = float(np.mean([r.x for r in radars0])); cy = float(np.mean([r.y for r in radars0]))
+    conv = reaim_convergent(radars0, (cx, cy)); pts = corridor_points(radars0)
+    print(f"\n  [aim sensitivity, M={len(radars0)} R=50]")
+    for tag, rr in (("toward-road", radars0), ("convergent->centroid", conv)):
+        covis, ia, ic = coverage_and_ambiguity(rr, 50.0, hfov, pts)
+        print(f"    {tag:<22} cov>=3={100*np.mean(covis>=3):5.1f}%  "
+              f"topo(across)={100*np.mean(ic):5.1f}%")
+
+
 def main():
     here = Path(__file__).resolve().parents[1]
     ap = argparse.ArgumentParser()
@@ -130,6 +220,13 @@ def main():
     ap.add_argument("--fov-half", type=float, default=60.0)
     ap.add_argument("--theta3db", type=float, default=15.0)
     ap.add_argument("--target-mass", type=float, default=0.9)
+    ap.add_argument("--cov-rmax", default="35,50,70",
+                    help="comma-separated R_max (m) values for the co-visibility sweep")
+    ap.add_argument("--aim", choices=["toward-road", "convergent"], default="toward-road",
+                    help="boresight aim for the coverage analysis (convergent backfires; for comparison)")
+    ap.add_argument("--focal", default=None, help="convergent focal point 'x,y' (default=rig centroid)")
+    ap.add_argument("--target-cov3", type=float, default=0.6, help="PASS threshold on cov>=3 fraction")
+    ap.add_argument("--target-topo", type=float, default=0.5, help="PASS threshold on max topo-info fraction")
     args = ap.parse_args()
 
     cfg = json.load(open(here / "config" / f"radar_layout_extrinsics_{args.map}.json"))
@@ -153,6 +250,12 @@ def main():
     for k, a in rows:
         print(f"  M={a['M']:>2}: order={'→'.join(a['ordered_ids'])}")
         print(f"        discord: {a['discord_examples']}")
+
+    rmax_list = [float(x) for x in args.cov_rmax.split(",") if x.strip()]
+    focal = tuple(float(v) for v in args.focal.split(",")) if args.focal else None
+    coverage_section(layouts, hfov=args.fov_half * 2, rmax_list=rmax_list,
+                     aim=args.aim, focal=focal,
+                     target_cov3=args.target_cov3, target_topo=args.target_topo)
 
 
 if __name__ == "__main__":
