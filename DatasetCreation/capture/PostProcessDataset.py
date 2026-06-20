@@ -56,13 +56,20 @@ ACTOR_FRAMES_JSONL = "actor_frames.jsonl"
 # ---------------------------------------------------------------------------
 # RCS calibration defaults
 # ---------------------------------------------------------------------------
+# Targets are the EMPIRICAL per-class median dBsm measured in RadarScenes (relative/
+# uncalibrated dBsm — comparable within-dataset only). We match these so our dynamic RCS
+# sits on the SAME scale as the static distribution ([[static_rcs_inverse_cdf]]), i.e.
+# static-vs-dynamic RCS overlaps near-totally (RadarScenes OVL 0.86, AUC 0.55) and RCS is
+# NOT an artificial static/dynamic shortcut — Doppler (static |v|≈0) is the real separator.
+# (Earlier values were ABSOLUTE physical RCS from literature — car +7, truck +15 — which put
+# our dynamics ~13-14 dB above the static bulk and made RCS a fake separator: OVL 0.67/AUC 0.68.)
 DEFAULT_TARGET_MEDIAN_DBSM = {
-    "pedestrian": -11.0,
-    "car":          7.0,
-    "truck":       15.0,
-    "bus":         12.0,
-    "bicycle":     -5.0,
-    "motorcycle":   0.0,
+    "pedestrian": -7.9,   # RadarScenes pedestrian
+    "car":        -4.9,   # RadarScenes car
+    "truck":       1.3,   # RadarScenes truck
+    "bus":        -2.5,   # RadarScenes bus
+    "bicycle":   -11.2,   # RadarScenes bike
+    "motorcycle": -9.0,   # not in RadarScenes; between bike and ped (moot: 4-wheel filter spawns none)
 }
 
 # Two-scale noise sigmas: (per-actor Gaussian offset, per-frame Swerling-1 scale).
@@ -118,6 +125,32 @@ DEFAULT_MICRO_DOPPLER_SIGMA = 1.0
 DEFAULT_FD_STRIDE = 10
 DEFAULT_MAX_WALKER_SPEED_MPS = 3.0
 
+# Static/clutter RCS — sampled from the RadarScenes static class (label 11) distribution
+# (115M detections). Static returns otherwise carry NO rcs_dBsm, which lets RCS
+# presence-vs-absence trivially separate static from dynamic. Knots = (cumulative prob,
+# dBsm percentile); piecewise-linear inverse CDF with a HARD floor at -30.6 (the sensor
+# CFAR/detection cutoff — a censored edge, not physics, so never extrapolate below it),
+# right-skewed bright tail to +58.7 (specular metal). Sampled once per world voxel so a
+# given reflector keeps a consistent RCS across frames (no flicker).
+RADARSCENES_STATIC_RCS_CDF = (
+    (0.000, -30.60), (0.001, -29.50), (0.010, -26.53), (0.050, -23.33),
+    (0.250, -15.18), (0.500, -7.38), (0.750, 1.57), (0.950, 16.16),
+    (0.990, 26.55), (0.999, 37.40), (1.000, 58.71),
+)
+DEFAULT_STATIC_RCS_VOXEL_M = 1.0
+
+
+def static_rcs_inverse_cdf(u: float) -> float:
+    """Map u in [0,1] to a dBsm value via the RadarScenes static percentile knots."""
+    knots = RADARSCENES_STATIC_RCS_CDF
+    if u <= knots[0][0]:
+        return knots[0][1]
+    for (p0, v0), (p1, v1) in zip(knots, knots[1:]):
+        if u <= p1:
+            t = (u - p0) / (p1 - p0) if p1 > p0 else 0.0
+            return v0 + t * (v1 - v0)
+    return knots[-1][1]
+
 # ---------------------------------------------------------------------------
 # FMCW realism defaults  (RS35 preset: B=400 MHz, N_s=256, f_c=76 GHz)
 # See DatasetCreation/tools/fmcw_radar_config.py for derivation.
@@ -139,6 +172,12 @@ DEFAULT_FMCW_ANTENNA_GAIN_DBI   = 15.0
 DEFAULT_FMCW_NOISE_FIGURE_DB    = 12.0
 DEFAULT_FMCW_SYSTEM_LOSS_DB     = 3.0
 DEFAULT_FMCW_SNR_THRESHOLD_DB   = 10.0
+# Static class: NO SNR re-gating. Static rcs_dBsm is sampled from the RadarScenes static
+# distribution, which is ALREADY post-CFAR (its -30.6 dBsm floor IS the detector cutoff).
+# Re-applying our SNR gate would double-censor and bias the detected-static RCS high
+# (median +0.3 instead of -7.4). -inf threshold = pass all sampled static returns; range/
+# velocity/P_d gates still apply. Dynamic returns keep the physical 10 dB threshold.
+DEFAULT_FMCW_SNR_THRESHOLD_STATIC_DB = float("-inf")
 DEFAULT_FMCW_P_DETECT           = 0.9
 DEFAULT_FMCW_AZ_SIGMA_0_DEG     = 6.0
 DEFAULT_FMCW_AZ_SIGMA_FLOOR_DEG = 0.3
@@ -363,6 +402,7 @@ def post_process_capture_dir(
     fmcw_noise_figure_db: float = DEFAULT_FMCW_NOISE_FIGURE_DB,
     fmcw_system_loss_db: float = DEFAULT_FMCW_SYSTEM_LOSS_DB,
     fmcw_snr_threshold_db: float = DEFAULT_FMCW_SNR_THRESHOLD_DB,
+    fmcw_snr_threshold_static_db: float = DEFAULT_FMCW_SNR_THRESHOLD_STATIC_DB,
     fmcw_p_detect: float = DEFAULT_FMCW_P_DETECT,
     fmcw_az_sigma_0_deg: float = DEFAULT_FMCW_AZ_SIGMA_0_DEG,
     fmcw_az_sigma_floor_deg: float = DEFAULT_FMCW_AZ_SIGMA_FLOOR_DEG,
@@ -510,9 +550,22 @@ def post_process_capture_dir(
             frame_offset_cache[key] = _swerling1_dB(local_rng, sf)
         return frame_offset_cache[key]
 
+    # Static/clutter RCS, sampled once per world voxel (per-reflector correlation).
+    static_rcs_cache: dict = {}
+
+    def _static_rcs_dbsm(wx: float, wy: float, wz: float) -> float:
+        vx = int(math.floor(wx / DEFAULT_STATIC_RCS_VOXEL_M))
+        vy = int(math.floor(wy / DEFAULT_STATIC_RCS_VOXEL_M))
+        vz = int(math.floor(wz / DEFAULT_STATIC_RCS_VOXEL_M))
+        key = (vx, vy, vz)
+        if key not in static_rcs_cache:
+            u = random.Random(f"{seed}|static|{vx}|{vy}|{vz}").random()
+            static_rcs_cache[key] = static_rcs_inverse_cdf(u)
+        return static_rcs_cache[key]
+
     stats = {
         "walker_fixed": 0, "walker_skipped": 0, "walker_clamped": 0,
-        "rcs_written": 0, "spikes": 0,
+        "rcs_written": 0, "static_rcs": 0, "spikes": 0,
         "snr_written": 0, "visible_1": 0,
         "invis_range": 0, "invis_vel": 0, "invis_snr": 0,
     }
@@ -644,8 +697,35 @@ def post_process_capture_dir(
                             row["rcs_dBsm"] = ""
                     except ValueError:
                         row["rcs_dBsm"] = ""
-                else:
+                elif kind in ("vehicle", "pedestrian"):
+                    # Dynamic actor without a usable rcs_proxy_m2 — leave blank.
                     row["rcs_dBsm"] = ""
+                else:
+                    # Static/clutter: sample the RadarScenes static distribution,
+                    # correlated per reflector (world-space voxel). Set rcs_dBsm_val so
+                    # the FMCW stage below gates static returns by SNR like dynamic ones.
+                    row["rcs_dBsm"] = ""
+                    try:
+                        depth = float(row["depth_m"])
+                        az    = float(row["azimuth_rad"])
+                        alt   = float(row["altitude_rad"])
+                        sx    = float(row["sensor_world_x_m"])
+                        sy    = float(row["sensor_world_y_m"])
+                        sz    = float(row["sensor_world_z_m"])
+                        yaw   = math.radians(float(row["sensor_yaw_deg"]))
+                        ca = math.cos(alt)
+                        lx = depth * ca * math.cos(az)
+                        ly = depth * ca * math.sin(az)
+                        lz = depth * math.sin(alt)
+                        wx = sx + lx * math.cos(yaw) - ly * math.sin(yaw)
+                        wy = sy + lx * math.sin(yaw) + ly * math.cos(yaw)
+                        wz = sz + lz
+                        sdbsm = _static_rcs_dbsm(wx, wy, wz)
+                        row["rcs_dBsm"] = f"{sdbsm:.4f}"
+                        rcs_dBsm_val = sdbsm
+                        stats["static_rcs"] += 1
+                    except (ValueError, KeyError):
+                        pass
 
                 # --------------------------------------------------------
                 # [C] FMCW realism: SNR, visibility flag, noisy measurements
@@ -670,7 +750,12 @@ def post_process_capture_dir(
                         )
                         snr_dB_out    = f"{snr_dB_val:.4f}"
                         snr_lin_noise = max(10.0 ** (snr_dB_val / 10.0), 0.01)
-                        if snr_dB_val >= fmcw_snr_threshold_db:
+                        # Static returns bypass SNR gating (their RCS is already a
+                        # post-CFAR sample); dynamics keep the physical threshold.
+                        thr = (fmcw_snr_threshold_db
+                               if kind in ("vehicle", "pedestrian")
+                               else fmcw_snr_threshold_static_db)
+                        if snr_dB_val >= thr:
                             snr_ok = rng.random() < fmcw_p_detect
                         else:
                             snr_ok = False
@@ -711,6 +796,8 @@ def post_process_capture_dir(
         print(f"  Walker speeds clamped       : {stats['walker_clamped']:,} "
               f"({pct:.2f}% above {max_walker_speed:.1f} m/s)", flush=True)
     print(f"  rcs_dBsm cells written      : {stats['rcs_written']:,}", flush=True)
+    print(f"  static rcs_dBsm (RadarScenes): {stats['static_rcs']:,} "
+          f"({len(static_rcs_cache):,} reflector voxels)", flush=True)
     print(f"  Specular spikes added       : {stats['spikes']:,} "
           f"({100.0*stats['spikes']/max(stats['rcs_written'],1):.2f}% of matched rows)",
           flush=True)
