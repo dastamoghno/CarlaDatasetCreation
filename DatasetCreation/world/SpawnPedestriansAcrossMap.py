@@ -46,16 +46,50 @@ DEFAULT_PED_SPAWN_RADIUS_M = 60.0
 # --- Mid-block corridor crossers ------------------------------------------------
 # CARLA's navmesh AI only crosses roads at map-defined crosswalks, and the corridor
 # has exactly one (at the west junction ~(-31,-61)). To get pedestrians crossing the
-# ROAD mid-block in radar view, a subset of walkers is driven manually straight across
-# the corridor (direct WalkerControl, no AI controller), shuttling between the south
-# and north curbs at chosen x-positions. Opt-in via DATASET_PED_CROSSING_COUNT > 0;
-# those crossers are taken from the total pedestrian count (the rest roam on AI).
+# ROAD mid-block in radar view, a subset of walkers is driven manually across the
+# corridor (direct WalkerControl, no AI controller). Opt-in via
+# DATASET_PED_CROSSING_COUNT > 0; those crossers are taken from the total pedestrian
+# count (the rest roam on AI).
+#
+# Each crosser runs a small state machine for *natural* (non-continuous) crossings:
+#   WAIT   - stand at a curb for a random dwell (and optionally hold for a gap in
+#            traffic) so crossings are intermittent, not a synchronized conveyor.
+#   CROSS  - traverse the road once to the opposite curb.
+#   STROLL - walk along the far curb to a new random x, so successive crossings
+#            happen at different points across the radar zone.
+# Per-crosser speed and dwell are randomized, and initial timers are staggered, so
+# the crossers desync instead of marching in lockstep (the old shuttle behavior).
 DEFAULT_PED_CROSSING_COUNT = 0
 DEFAULT_PED_CROSSING_X_MIN = -25.0     # radar zone spans x ~[-29, 66]
 DEFAULT_PED_CROSSING_X_MAX = 60.0
 DEFAULT_PED_CROSSING_Y_SOUTH = -72.0   # south curb (south radars at y=-73.5)
 DEFAULT_PED_CROSSING_Y_NORTH = -54.0   # north curb (north radars at y=-52.5)
-DEFAULT_PED_CROSSING_SPEED = 1.4       # m/s; raise for joggers
+DEFAULT_PED_CROSSING_SPEED = 1.4       # m/s; legacy fixed speed (overrides the range)
+# Per-crossing speed range (sampled unless DATASET_PED_CROSSING_SPEED pins a value).
+DEFAULT_PED_CROSSING_SPEED_MIN = 0.9   # m/s, slow walk
+DEFAULT_PED_CROSSING_SPEED_MAX = 1.8   # m/s, brisk walk / light jog
+# Random dwell at the curb between crossings (seconds, simulation time).
+DEFAULT_PED_CROSSING_DWELL_MIN = 2.0
+DEFAULT_PED_CROSSING_DWELL_MAX = 8.0
+# Optional gap-acceptance: hold at curb if a vehicle is within GAP_M of the crossing
+# column, up to GAP_MAX_WAIT seconds. Off by default — crossing through traffic puts
+# pedestrians at vehicle depths/bearings (helps decorrelate class from position).
+DEFAULT_PED_CROSSING_GAP_M = 12.0
+DEFAULT_PED_CROSSING_GAP_MAX_WAIT = 15.0
+
+# Mid-cross car-yield (default ON): while crossing, a crosser pauses if a *moving*
+# vehicle is within YIELD_DIST and closing on it, then resumes once that car has
+# passed or stopped. Crossers are invincible + kinematic (immovable), so a car that
+# can't brake in time flips on contact and stalls the corridor — this prevents the
+# collision. Only MOVING cars trigger it (a stopped/yielding car does not), so it
+# avoids the mutual standoff the curb gap-check caused.
+DEFAULT_PED_CROSSING_CAR_YIELD = True
+DEFAULT_PED_CROSSING_YIELD_DIST_M = 7.0      # how close an approaching car must be
+DEFAULT_PED_CROSSING_YIELD_MOVING_MPS = 2.0  # below this the car counts as stopped
+
+# Arrival tolerance (m): per-tick walker step (~speed * dt ≈ 0.07 m) is far below
+# this, so a curb / x-target is reliably detected without skipping past it.
+_CROSS_ARRIVE_EPS = 0.4
 
 
 def keep_pedestrians_running() -> bool:
@@ -130,6 +164,88 @@ def ped_crossing_span_from_env():
         _f("DATASET_PED_CROSSING_Y_NORTH", DEFAULT_PED_CROSSING_Y_NORTH),
         _f("DATASET_PED_CROSSING_SPEED", DEFAULT_PED_CROSSING_SPEED),
     )
+
+
+def _float_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def ped_crossing_speed_range_from_env():
+    """(lo, hi) m/s for per-crossing speed sampling.
+
+    If DATASET_PED_CROSSING_SPEED is set explicitly, crossers use that fixed speed
+    (lo == hi) for back-compat; otherwise [MIN, MAX] is sampled per crossing so the
+    crossers walk at varied speeds (some slow, some brisk)."""
+    fixed = os.environ.get("DATASET_PED_CROSSING_SPEED", "").strip()
+    if fixed:
+        try:
+            v = float(fixed)
+            return v, v
+        except ValueError:
+            pass
+    lo = _float_env("DATASET_PED_CROSSING_SPEED_MIN", DEFAULT_PED_CROSSING_SPEED_MIN)
+    hi = _float_env("DATASET_PED_CROSSING_SPEED_MAX", DEFAULT_PED_CROSSING_SPEED_MAX)
+    return (hi, lo) if hi < lo else (lo, hi)
+
+
+def ped_crossing_dwell_range_from_env():
+    """(lo, hi) seconds of curb dwell between crossings (simulation time)."""
+    lo = max(0.0, _float_env("DATASET_PED_CROSSING_DWELL_MIN", DEFAULT_PED_CROSSING_DWELL_MIN))
+    hi = max(lo, _float_env("DATASET_PED_CROSSING_DWELL_MAX", DEFAULT_PED_CROSSING_DWELL_MAX))
+    return lo, hi
+
+
+def ped_crossing_gap_from_env():
+    """(enabled, gap_m, max_wait_s) for optional traffic gap-acceptance at the curb."""
+    enabled = os.environ.get("DATASET_PED_CROSSING_GAP_CHECK", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    gap_m = _float_env("DATASET_PED_CROSSING_GAP_M", DEFAULT_PED_CROSSING_GAP_M)
+    max_wait = _float_env("DATASET_PED_CROSSING_GAP_MAX_WAIT", DEFAULT_PED_CROSSING_GAP_MAX_WAIT)
+    return enabled, gap_m, max_wait
+
+
+def ped_crossing_car_yield_from_env():
+    """(enabled, yield_dist_m, moving_mps) for the mid-cross moving-car yield."""
+    raw = os.environ.get("DATASET_PED_CROSSING_CAR_YIELD", "").strip().lower()
+    enabled = DEFAULT_PED_CROSSING_CAR_YIELD if raw == "" else raw in ("1", "true", "yes", "on")
+    dist = _float_env("DATASET_PED_CROSSING_YIELD_DIST_M", DEFAULT_PED_CROSSING_YIELD_DIST_M)
+    moving = _float_env("DATASET_PED_CROSSING_YIELD_MOVING_MPS", DEFAULT_PED_CROSSING_YIELD_MOVING_MPS)
+    return enabled, dist, moving
+
+
+def crossing_config_from_env():
+    """Bundle all mid-block crossing parameters into one dict (built once per run)."""
+    x_min, x_max, y_south, y_north, _legacy_speed = ped_crossing_span_from_env()
+    speed_lo, speed_hi = ped_crossing_speed_range_from_env()
+    dwell_min, dwell_max = ped_crossing_dwell_range_from_env()
+    gap_check, gap_m, gap_max_wait = ped_crossing_gap_from_env()
+    car_yield, yield_dist, yield_moving = ped_crossing_car_yield_from_env()
+    return {
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_south": y_south,
+        "y_north": y_north,
+        "speed_lo": speed_lo,
+        "speed_hi": speed_hi,
+        "dwell_min": dwell_min,
+        "dwell_max": dwell_max,
+        "gap_check": gap_check,
+        "gap_m": gap_m,
+        "gap_max_wait": gap_max_wait,
+        "car_yield": car_yield,
+        "yield_dist": yield_dist,
+        "yield_moving": yield_moving,
+    }
 
 
 def ped_retarget_interval_s_from_env() -> float:
@@ -349,15 +465,30 @@ def spawn_pedestrians_with_ai(client, world, count):
     return walkers, controllers, skipped, sync_mode
 
 
-def spawn_corridor_crossers(client, world, count):
-    """Spawn `count` walkers that march straight across the corridor mid-block, driven
-    by direct WalkerControl (no AI controller). Returns a list of state dicts
-    {walker, dir, speed} plus (y_south, y_north). Crossers alternate start side so some
-    head north and some south, and they are spread evenly across the x-band so they
-    cover the radar zone. They are made invincible so a passing vehicle doesn't ragdoll
-    them mid-crossing (TM still brakes for them) — keeps the crossing pattern stable."""
+def _sim_time(world) -> float:
+    """Simulation clock (seconds). Robust to sync/async mode — used for crosser dwell
+    timers so durations are in simulation time, not wall-clock."""
+    try:
+        return world.get_snapshot().timestamp.elapsed_seconds
+    except RuntimeError:
+        return 0.0
+
+
+def _sample_crossing_speed(cfg) -> float:
+    lo, hi = cfg["speed_lo"], cfg["speed_hi"]
+    return lo if hi <= lo else random.uniform(lo, hi)
+
+
+def spawn_corridor_crossers(client, world, count, cfg):
+    """Spawn `count` walkers that cross the corridor mid-block, driven by direct
+    WalkerControl (no AI controller). Returns a list of per-crosser state dicts.
+
+    Crossers alternate start curb and are spread across the x-band to cover the radar
+    zone. Each starts in WAIT with a staggered timer so they don't cross in lockstep.
+    They are made invincible so a passing vehicle doesn't ragdoll them mid-crossing
+    (TM still brakes for them)."""
     if count <= 0:
-        return [], (DEFAULT_PED_CROSSING_Y_SOUTH, DEFAULT_PED_CROSSING_Y_NORTH)
+        return []
 
     SpawnActor = carla.command.SpawnActor
     bp_lib = world.get_blueprint_library()
@@ -365,7 +496,8 @@ def spawn_corridor_crossers(client, world, count):
     if not walker_bps:
         raise RuntimeError("No walker.pedestrian.* blueprints found.")
 
-    x_min, x_max, y_south, y_north, speed = ped_crossing_span_from_env()
+    x_min, x_max = cfg["x_min"], cfg["x_max"]
+    y_south, y_north = cfg["y_south"], cfg["y_north"]
     # Ground height near the corridor centre (so walkers spawn at road level).
     wp = world.get_map().get_waypoint(
         carla.Location(x=(x_min + x_max) / 2.0, y=(y_south + y_north) / 2.0, z=0.0),
@@ -373,7 +505,7 @@ def spawn_corridor_crossers(client, world, count):
     )
     base_z = (wp.transform.location.z if wp is not None else 0.0) + 1.0
 
-    batch, dirs = [], []
+    batch, sides = [], []
     for i in range(count):
         frac = (i + 0.5) / count
         x = x_min + (x_max - x_min) * frac
@@ -388,7 +520,7 @@ def spawn_corridor_crossers(client, world, count):
             carla.Rotation(yaw=90.0 if d > 0 else -90.0),
         )
         batch.append(SpawnActor(bp, tf))
-        dirs.append(d)
+        sides.append(start_south)
 
     results = client.apply_batch_sync(batch, True)
 
@@ -398,47 +530,154 @@ def spawn_corridor_crossers(client, world, count):
     else:
         world.wait_for_tick()
 
+    now = _sim_time(world)
+    _, dwell_max = cfg["dwell_min"], cfg["dwell_max"]
     crossers = []
-    for res, d in zip(results, dirs):
+    for res, start_south in zip(results, sides):
         if res.error:
             print(f"  crosser spawn failed: {res.error}", flush=True)
             continue
         w = world.get_actor(res.actor_id)
         if w is None:
             continue
-        w.apply_control(carla.WalkerControl(direction=carla.Vector3D(0.0, d, 0.0), speed=speed))
-        crossers.append({"walker": w, "dir": d, "speed": speed})
+        # Begin standing at the spawn curb; a staggered dwell desyncs the first wave.
+        w.apply_control(carla.WalkerControl(speed=0.0))
+        crossers.append(
+            {
+                "walker": w,
+                "state": "WAIT",
+                "curb": "S" if start_south else "N",
+                "speed": _sample_crossing_speed(cfg),   # stroll speed for this crosser
+                "cross_speed": _sample_crossing_speed(cfg),
+                "x_target": None,
+                "y_target": None,
+                "wait_until": now + random.uniform(0.0, dwell_max),
+            }
+        )
         loc = w.get_location()
         print(
             f"  crosser walker_id={w.id} at ({loc.x:.1f}, {loc.y:.1f}) "
-            f"heading={'N' if d > 0 else 'S'} speed={speed:.2f}",
+            f"start_curb={'S' if start_south else 'N'} speed={crossers[-1]['speed']:.2f}",
             flush=True,
         )
 
     print(
         f"[ped] {len(crossers)} mid-block crossers over x=[{x_min:.0f},{x_max:.0f}], "
-        f"y=[{y_south:.0f},{y_north:.0f}] (manual WalkerControl, no AI).",
+        f"y=[{y_south:.0f},{y_north:.0f}] (WAIT/CROSS/STROLL state machine, no AI).",
         flush=True,
     )
-    return crossers, (y_south, y_north)
+    return crossers
 
 
-def update_crossers(crossers, y_south, y_north):
-    """Re-issue WalkerControl each tick; flip direction at each curb so crossers shuttle
-    back and forth across the corridor indefinitely."""
+def _road_clear(world, x, cfg) -> bool:
+    """True if no vehicle currently sits on the crossing column near `x` (between the
+    curbs). Used for optional gap-acceptance before stepping off the curb."""
+    gap = cfg["gap_m"]
+    y_lo = min(cfg["y_south"], cfg["y_north"]) - 2.0
+    y_hi = max(cfg["y_south"], cfg["y_north"]) + 2.0
+    try:
+        vehicles = world.get_actors().filter("vehicle.*")
+    except RuntimeError:
+        return True
+    for v in vehicles:
+        try:
+            l = v.get_location()
+        except RuntimeError:
+            continue
+        if y_lo <= l.y <= y_hi and abs(l.x - x) <= gap:
+            return False
+    return True
+
+
+def _approaching_car(world, px, py, cfg) -> bool:
+    """True if a *moving* vehicle (>= yield_moving m/s) is within yield_dist of
+    (px, py) and closing on it. Stopped/yielding cars are ignored on purpose, so a
+    crosser resumes once an approaching car has braked (no mutual standoff)."""
+    if not cfg["car_yield"]:
+        return False
+    yd = cfg["yield_dist"]
+    yd_sq = yd * yd
+    vmin_sq = cfg["yield_moving"] * cfg["yield_moving"]
+    try:
+        vehicles = world.get_actors().filter("vehicle.*")
+    except RuntimeError:
+        return False
+    for v in vehicles:
+        try:
+            l = v.get_location()
+            vel = v.get_velocity()
+        except RuntimeError:
+            continue
+        dx = px - l.x
+        dy = py - l.y
+        if dx * dx + dy * dy > yd_sq:
+            continue
+        if vel.x * vel.x + vel.y * vel.y < vmin_sq:
+            continue  # stopped/slow car -> don't yield to it (avoids standoff)
+        if vel.x * dx + vel.y * dy > 0.0:  # car velocity points toward the crosser
+            return True
+    return False
+
+
+def step_crossers(world, crossers, cfg, now):
+    """Advance each crosser's WAIT -> CROSS -> STROLL state machine by one tick."""
     for c in crossers:
         w = c["walker"]
         try:
             if not w.is_alive:
                 continue
-            y = w.get_location().y
-            if c["dir"] > 0 and y >= y_north:
-                c["dir"] = -1.0
-            elif c["dir"] < 0 and y <= y_south:
-                c["dir"] = 1.0
-            w.apply_control(
-                carla.WalkerControl(direction=carla.Vector3D(0.0, c["dir"], 0.0), speed=c["speed"])
-            )
+            loc = w.get_location()
+            state = c["state"]
+
+            if state == "WAIT":
+                w.apply_control(carla.WalkerControl(speed=0.0))
+                if now < c["wait_until"]:
+                    continue
+                # Dwell elapsed. Optionally hold for a gap in traffic (bounded so a
+                # crosser never waits forever on a busy corridor).
+                if (
+                    cfg["gap_check"]
+                    and (now - c["wait_until"]) < cfg["gap_max_wait"]
+                    and not _road_clear(world, loc.x, cfg)
+                ):
+                    continue
+                # Step off toward the opposite curb.
+                c["y_target"] = cfg["y_north"] if c["curb"] == "S" else cfg["y_south"]
+                c["cross_speed"] = _sample_crossing_speed(cfg)
+                c["state"] = "CROSS"
+
+            elif state == "CROSS":
+                # Yield to an approaching moving car: stand still and let it pass (or
+                # brake). Prevents driving a car into the immovable crosser (which
+                # flips the car and stalls the corridor). Resumes once clear/stopped.
+                if _approaching_car(world, loc.x, loc.y, cfg):
+                    w.apply_control(carla.WalkerControl(speed=0.0))
+                    continue
+                d = 1.0 if c["y_target"] > loc.y else -1.0
+                w.apply_control(
+                    carla.WalkerControl(
+                        direction=carla.Vector3D(0.0, d, 0.0), speed=c["cross_speed"]
+                    )
+                )
+                if abs(loc.y - c["y_target"]) <= _CROSS_ARRIVE_EPS:
+                    # Reached the far curb; pick a new x to stroll to for variety.
+                    c["curb"] = "N" if c["curb"] == "S" else "S"
+                    c["x_target"] = random.uniform(cfg["x_min"], cfg["x_max"])
+                    c["state"] = "STROLL"
+
+            elif state == "STROLL":
+                dx = c["x_target"] - loc.x
+                if abs(dx) <= _CROSS_ARRIVE_EPS:
+                    w.apply_control(carla.WalkerControl(speed=0.0))
+                    c["state"] = "WAIT"
+                    c["wait_until"] = now + random.uniform(cfg["dwell_min"], cfg["dwell_max"])
+                else:
+                    d = 1.0 if dx > 0 else -1.0
+                    w.apply_control(
+                        carla.WalkerControl(
+                            direction=carla.Vector3D(d, 0.0, 0.0), speed=c["speed"]
+                        )
+                    )
         except RuntimeError:
             continue
 
@@ -505,10 +744,18 @@ def main():
         client, world, ai_count
     )
 
-    crossers, (cross_y_south, cross_y_north) = spawn_corridor_crossers(
-        client, world, crossing_count
-    )
+    crossing_cfg = crossing_config_from_env()
+    crossers = spawn_corridor_crossers(client, world, crossing_count, crossing_cfg)
     crosser_walkers = [c["walker"] for c in crossers]
+    if crossing_count > 0:
+        print(
+            f"[ped] crossing params: speed=[{crossing_cfg['speed_lo']:.2f},"
+            f"{crossing_cfg['speed_hi']:.2f}] m/s, dwell=[{crossing_cfg['dwell_min']:.1f},"
+            f"{crossing_cfg['dwell_max']:.1f}] s, gap_check={crossing_cfg['gap_check']}, "
+            f"car_yield={crossing_cfg['car_yield']} (dist={crossing_cfg['yield_dist']:.0f}m, "
+            f"moving>{crossing_cfg['yield_moving']:.1f}m/s).",
+            flush=True,
+        )
 
     print(
         f"Spawned {len(walkers)}/{ai_count} AI + {len(crossers)}/{crossing_count} crossers "
@@ -540,8 +787,8 @@ def main():
             else:
                 world.wait_for_tick()
 
-            # Keep mid-block crossers shuttling across the road every tick.
-            update_crossers(crossers, cross_y_south, cross_y_north)
+            # Advance the mid-block crossers' WAIT/CROSS/STROLL state machine.
+            step_crossers(world, crossers, crossing_cfg, _sim_time(world))
 
             now = time.time()
             if now >= next_retarget:

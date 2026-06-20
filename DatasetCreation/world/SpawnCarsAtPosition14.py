@@ -38,7 +38,7 @@ TARGET_CAR_COUNT = 30
 # 30% of all labels — a per-actor memorization shortcut). Recirculation then yields
 # many distinct trucks over a capture. Override via DATASET_VEHICLE_TRUCK_FRACTION
 # or derive from DATASET_TARGET_TRUCK_COUNT.
-DEFAULT_TRUCK_FRACTION = 0.20
+DEFAULT_TRUCK_FRACTION = 0.10
 # Poisson process rate (lambda): expected spawns per second. Higher = fleet fills
 # faster (more cars on the road sooner). Paired with the smaller MOVE_AWAY_DISTANCE_M.
 SPAWN_RATE_PER_SECOND = 1.0
@@ -319,6 +319,10 @@ def apply_free_driving_policy(traffic_manager, actor, world_map=None, spawn_tran
         traffic_manager.ignore_signs_percentage(actor, 0.0)
     if hasattr(traffic_manager, "ignore_vehicles_percentage"):
         traffic_manager.ignore_vehicles_percentage(actor, 0.0)
+    # Always yield to pedestrians: 0% chance of ignoring a walker, so the TM brakes
+    # for crossers/jaywalkers instead of running them over.
+    if hasattr(traffic_manager, "ignore_walkers_percentage"):
+        traffic_manager.ignore_walkers_percentage(actor, 0.0)
 
     # Crash prevention: enforce a safe gap and cap speed.
     if hasattr(traffic_manager, "distance_to_leading_vehicle"):
@@ -354,6 +358,13 @@ def apply_straight_driving_policy(traffic_manager, actor, world_map, spawn_trans
         traffic_manager.keep_right_rule_percentage(actor, 100.0)
     elif hasattr(traffic_manager, "keep_slow_lane_rule_percentage"):
         traffic_manager.keep_slow_lane_rule_percentage(actor, 100.0)
+
+    # Yield to other vehicles and pedestrians (0% ignore) so cars brake for
+    # crossers instead of running them over.
+    if hasattr(traffic_manager, "ignore_vehicles_percentage"):
+        traffic_manager.ignore_vehicles_percentage(actor, 0.0)
+    if hasattr(traffic_manager, "ignore_walkers_percentage"):
+        traffic_manager.ignore_walkers_percentage(actor, 0.0)
 
     # Crash prevention: enforce a safe gap and cap speed.
     if hasattr(traffic_manager, "distance_to_leading_vehicle"):
