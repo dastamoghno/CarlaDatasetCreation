@@ -26,7 +26,7 @@ from capture.CaptureRadarCameraData import (
     destroy_dataset_radars,
     radar_sensor_tick_s_from_env,
 )
-from capture.radar_layout import radar_pitch_deg_from_env
+from capture.radar_layout import radar_pitch_deg_from_env, radar_height_m_from_env
 from dataset_paths import config_dir
 
 KEEP_SENSORS_RUNNING = os.environ.get("DATASET_KEEP_SENSORS_RUNNING", "").lower() in (
@@ -257,25 +257,26 @@ def main():
         f"Radar blueprint: range={int(RADAR_MAX_RANGE_M)} m, "
         f"HFOV={int(RADAR_HORIZONTAL_FOV_DEG)}°, "
         f"VFOV={int(RADAR_VERTICAL_FOV_DEG)}°, "
-        f"pitch={radar_pitch_deg_from_env():.1f}°, "
+        f"pitch={radar_pitch_deg_from_env():.1f}°, height={radar_height_m_from_env():.1f}m, "
         f"points_per_second={radar_pps}, sensor_tick={radar_sensor_tick_s_from_env():g}",
     )
 
     # ~5 m from the nearest driving lane (was ~11 m — weak returns at shallow grazing angle).
     y_upper = -52.5
     y_lower = -73.5
+    rh = radar_height_m_from_env()   # mounting height (m); DATASET_RIG_HEIGHT_M (default 3.0)
     radar_positions = {
-        "R1": make_transform(-28.825321, y_upper, 3.0, 0.0, 0.0, 0.0),
-        "R2": make_transform(-28.825321, y_lower, 3.0, 0.0, 180.0, 0.0),
+        "R1": make_transform(-28.825321, y_upper, rh, 0.0, 0.0, 0.0),
+        "R2": make_transform(-28.825321, y_lower, rh, 0.0, 180.0, 0.0),
 
-        "R3": make_transform(3.355103, y_upper, 3.0, 0.0, 0.0, 0.0),
-        "R4": make_transform(3.355103, y_lower, 3.0, 0.0, 180.0, 0.0),
+        "R3": make_transform(3.355103, y_upper, rh, 0.0, 0.0, 0.0),
+        "R4": make_transform(3.355103, y_lower, rh, 0.0, 180.0, 0.0),
 
-        "R5": make_transform(38.535528, y_upper, 3.0, 0.0, 0.0, 0.0),
-        "R6": make_transform(38.535528, y_lower, 3.0, 0.0, 180.0, 0.0),
+        "R5": make_transform(38.535528, y_upper, rh, 0.0, 0.0, 0.0),
+        "R6": make_transform(38.535528, y_lower, rh, 0.0, 180.0, 0.0),
 
-        "R7": make_transform(65.715952, y_upper, 3.0, 0.0, 0.0, 0.0),
-        "R8": make_transform(65.715952, y_lower, 3.0, 0.0, 180.0, 0.0),
+        "R7": make_transform(65.715952, y_upper, rh, 0.0, 0.0, 0.0),
+        "R8": make_transform(65.715952, y_lower, rh, 0.0, 180.0, 0.0),
     }
 
     # Westbound corridor (R8→R2): flip radars whose default ±40° cone misses bearing ~180°.
