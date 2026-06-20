@@ -656,7 +656,10 @@ def main() -> None:
         return
 
     test_mode = run_mode == "test"
-    data_dir = data_output_dir(dc_root)
+    # Honor an externally-set capture base dir (e.g. run_sim.sh points this at /scratch,
+    # local + fast + roomy) instead of forcing captures onto the repo's Data/ (NFS home).
+    _env_capture_base = os.environ.get("DATASET_CAPTURE_BASE_DIR", "").strip()
+    data_dir = Path(_env_capture_base) if _env_capture_base else data_output_dir(dc_root)
     data_dir.mkdir(parents=True, exist_ok=True)
 
     child_env = os.environ.copy()
