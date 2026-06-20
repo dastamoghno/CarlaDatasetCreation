@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 from collections import OrderedDict
@@ -62,11 +63,20 @@ def snapshot_location(snapshot: dict) -> carla.Location:
 class ActorFrameLogger:
     """Append one JSON line per simulation frame (deduped).
 
-    Writes happen from CARLA's streaming thread (via TickActorSnapshotter._on_tick)
-    while close() is called from the main thread at shutdown. ``_write_lock`` makes
-    the write/close pair atomic so an in-flight tick can never write to a freshly
-    closed handle (the source of the ``I/O operation on closed file`` error seen
-    in capture 231410).
+    ``log_frame`` is called from CARLA's streaming thread (via
+    ``TickActorSnapshotter._on_tick``). In asynchronous mode the server free-runs
+    and silently drops the next ``on_tick`` if the previous callback hasn't
+    returned, so the callback MUST be cheap. Therefore ``log_frame`` only enqueues
+    the (frame_id, snapshots) tuple; a dedicated background **writer thread** does
+    the JSON serialization + disk write + flush off the hot path. This stops a slow
+    disk or a long serialization from stalling the callback and dropping actor
+    frames (the ~21% bursty gaps that turned matched returns into all-clutter).
+
+    ``close()`` is called from the main thread at shutdown: it enqueues a sentinel,
+    joins the writer (draining everything already queued), then closes the handle.
+    ``_write_lock`` keeps the final flush/close atomic against the writer so an
+    in-flight write can never hit a freshly closed handle (the
+    ``I/O operation on closed file`` error seen in capture 231410).
     """
 
     ACTOR_FRAMES_FILENAME = "actor_frames.jsonl"
@@ -75,26 +85,52 @@ class ActorFrameLogger:
         self._world = world
         self._path = Path(capture_dir) / self.ACTOR_FRAMES_FILENAME
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._seen_frames: set[int] = set()
+        self._seen_frames: set[int] = set()  # writer-thread-only; no lock needed
         self._write_lock = threading.Lock()
         self._closed = False
         self._handle = open(self._path, "a", encoding="utf-8")
+        # Unbounded queue: never block the on_tick callback. The writer thread is
+        # the sole consumer and the only thread that touches _seen_frames/_handle.
+        self._queue: "queue.Queue" = queue.Queue()
+        self._write_errors = 0
+        self._writer = threading.Thread(
+            target=self._writer_loop, name="actor-frame-writer", daemon=True
+        )
+        self._writer.start()
 
-    def close(self) -> None:
-        with self._write_lock:
-            if self._closed:
-                return
-            self._closed = True
+    def _writer_loop(self) -> None:
+        """Drain the queue: serialize + write each frame, flushing once caught up."""
+        while True:
+            item = self._queue.get()
             try:
-                self._handle.close()
-            except Exception:  # noqa: BLE001 - best-effort during shutdown
-                pass
+                if item is None:  # sentinel: all queued frames drained -> stop
+                    return
+                frame_id, actor_snapshots = item
+                try:
+                    self._write_record(frame_id, actor_snapshots)
+                except Exception as exc:  # noqa: BLE001 - never kill the writer
+                    self._write_errors += 1
+                    if self._write_errors <= 3:
+                        print(
+                            f"[capture] actor-frame writer error: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            finally:
+                self._queue.task_done()
+            # Batch writes during drop-burst-prone periods; flush when caught up so
+            # the file stays durable without an fsync-per-frame on the hot path.
+            if item is not None and self._queue.empty():
+                with self._write_lock:
+                    if not self._closed:
+                        try:
+                            self._handle.flush()
+                        except Exception:  # noqa: BLE001
+                            pass
 
-    def log_frame(self, frame_id: int, actor_snapshots: list[dict]) -> None:
+    def _write_record(self, frame_id: int, actor_snapshots: list[dict]) -> None:
         if frame_id in self._seen_frames:
             return
-        # Build the JSON line OUTSIDE the lock so we don't hold up close() while
-        # iterating actor snapshots.
         actors_out = []
         for snap in actor_snapshots:
             enriched = enrich_snapshot_with_bbox(self._world, snap)
@@ -119,7 +155,30 @@ class ActorFrameLogger:
                 return
             self._seen_frames.add(frame_id)
             self._handle.write(line)
-            self._handle.flush()
+
+    def log_frame(self, frame_id: int, actor_snapshots: list[dict]) -> None:
+        # Runs in CARLA's on_tick (streaming) thread: keep it O(1). The snapshot
+        # dicts are immutable post-build (also shared with the snapshotter cache),
+        # so handing the reference to the writer thread is safe.
+        if self._closed:
+            return
+        self._queue.put((int(frame_id), actor_snapshots))
+
+    def close(self) -> None:
+        # Stop accepting new frames, drain everything already queued, then close.
+        if self._closed:
+            return
+        self._queue.put(None)  # sentinel runs after all frames enqueued so far
+        self._writer.join(timeout=30.0)
+        with self._write_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._handle.flush()
+                self._handle.close()
+            except Exception:  # noqa: BLE001 - best-effort during shutdown
+                pass
 
     @staticmethod
     def load_by_frame(path: str | Path) -> dict[int, list[dict]]:
