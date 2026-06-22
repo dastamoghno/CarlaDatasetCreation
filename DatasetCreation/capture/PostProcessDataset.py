@@ -69,7 +69,7 @@ DEFAULT_TARGET_MEDIAN_DBSM = {
     "truck":       1.3,   # RadarScenes truck
     "bus":        -2.5,   # RadarScenes bus
     "bicycle":   -11.2,   # RadarScenes bike
-    "motorcycle": -9.0,   # not in RadarScenes; between bike and ped (moot: 4-wheel filter spawns none)
+    "motorcycle": -9.0,   # not in RadarScenes; between bike and ped
 }
 
 # Two-scale noise sigmas: (per-actor Gaussian offset, per-frame Swerling-1 scale).

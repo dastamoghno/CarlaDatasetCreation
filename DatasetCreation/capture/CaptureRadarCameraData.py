@@ -35,6 +35,8 @@ from capture.actor_frame_log import (
     snapshot_location,
 )
 from dataset_paths import capture_dir, data_output_dir
+from world.bicycle_sidewalk import is_bicycle_nav_pilot
+from world.vehicle_classes import vehicle_class_from_type_id
 from testing.RadarLabelingTestReport import (
     DetectionRecord,
     LabelingStatsCollector,
@@ -106,21 +108,6 @@ def _expected_radar_count_from_env() -> int:
 
 
 EXPECTED_RADAR_LABELS = {f"R{i}" for i in range(1, _expected_radar_count_from_env() + 1)}
-
-
-def vehicle_class_from_type_id(type_id):
-    type_lower = type_id.lower()
-    if any(token in type_lower for token in ("firetruck", "ambulance", "truck")):
-        return "truck"
-    if "bus" in type_lower:
-        return "bus"
-    if any(token in type_lower for token in ("motorcycle", "vespa", "yamaha", "kawasaki", "harley")):
-        return "motorcycle"
-    if any(token in type_lower for token in ("bicycle", "bike", "crossbike")):
-        return "bicycle"
-    if "van" in type_lower:
-        return "van"
-    return "car"
 
 
 def make_output_paths(base_dir):
@@ -378,6 +365,8 @@ def get_radar_target_snapshots(world):
         if snap is not None:
             snapshots.append(snap)
     for walker in world.get_actors().filter("walker.pedestrian.*"):
+        if is_bicycle_nav_pilot(walker):
+            continue
         snap = _snapshot_from_actor(
             walker, "pedestrian", pedestrian_class_from_type_id(walker.type_id)
         )
@@ -417,6 +406,8 @@ def make_fast_tick_snapshot_fn(world):
             kind = "vehicle"
             class_label = vehicle_class_from_type_id(type_id)
         elif type_id.startswith("walker.pedestrian."):
+            if is_bicycle_nav_pilot(actor):
+                return None
             kind = "pedestrian"
             class_label = pedestrian_class_from_type_id(type_id)
         else:
@@ -581,6 +572,8 @@ class RadarActorSnapshotCache:
                 snapshots.append(snap)
                 seen_ids.add(int(vehicle.id))
         for walker in self._world.get_actors().filter("walker.pedestrian.*"):
+            if is_bicycle_nav_pilot(walker):
+                continue
             snap = self._snapshot_with_cache(
                 walker, "pedestrian", pedestrian_class_from_type_id(walker.type_id)
             )

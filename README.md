@@ -147,7 +147,10 @@ DATASET_RADAR_POINTS_PER_SECOND=20000 DATASET_VEHICLE_SPEED_REDUCTION_PCT=25 \
 | Knob | Default | What it does |
 |------|---------|--------------|
 | `--radar-count` (CLI) | prompt | Sensor layout: `4`, `8`, `12`, or `14` |
-| `DATASET_TARGET_CAR_COUNT` | `30` | Vehicles to spawn |
+| `DATASET_TARGET_CAR_COUNT` | `30` | Total fleet size (cars + trucks + motorcycles + bicycles) |
+| `DATASET_VEHICLE_TRUCK_FRACTION` | `0.10` | Fraction of fleet that are trucks (remainder split among other classes) |
+| `DATASET_VEHICLE_MOTORCYCLE_FRACTION` | `0.0` | Fraction of fleet that are motorcycles |
+| `DATASET_VEHICLE_BICYCLE_FRACTION` | `0.0` | Fraction of fleet that are bicycles (50% road / 50% sidewalk by default) |
 | `DATASET_PEDESTRIAN_COUNT` | `30` | Pedestrians to spawn |
 | `DATASET_SPAWN_RADIUS_M` | `80.0` | Outer radius of the spawn annulus around the corridor |
 | `DATASET_SPAWN_EXCLUSION_RADIUS_M` | `0.0` | Inner radius cars must drive *in* from (`0` = fill the zone) |
@@ -247,7 +250,14 @@ All optional; set before `run_sim.sh` / `Start.py` / a script. Booleans accept `
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `DATASET_TARGET_CAR_COUNT` | `30` | Vehicles to spawn |
+| `DATASET_TARGET_CAR_COUNT` | `30` | Total fleet size (cars + trucks + motorcycles + bicycles) |
+| `DATASET_VEHICLE_TRUCK_FRACTION` | `0.10` | Target truck fraction of the fleet (`0`–`1`) |
+| `DATASET_VEHICLE_MOTORCYCLE_FRACTION` | `0.0` | Target motorcycle fraction of the fleet (`0`–`1`) |
+| `DATASET_VEHICLE_BICYCLE_FRACTION` | `0.0` | Target bicycle fraction of the fleet (`0`–`1`) |
+| `DATASET_BICYCLE_SIDEWALK_FRACTION` | `0.5` | Share of bicycles on sidewalk/crosswalk (kinematic); rest on road/TM |
+| `DATASET_BICYCLE_SIDEWALK_SPEED_MPS` | `1.6` | Sidewalk bicycle speed (m/s) |
+| `DATASET_BICYCLE_ROAD_SPEED_REDUCTION_PCT` | `40` | TM speed reduction for road bicycles |
+| `DATASET_MOTORCYCLE_ROAD_SPEED_REDUCTION_PCT` | `0` | TM speed reduction for motorcycles (`>0` to slow) |
 | `DATASET_PEDESTRIAN_COUNT` | `30` | Pedestrians to spawn |
 | `DATASET_SPAWN_CENTER_INDEX` | `144` | Spawn-point index used as the corridor center |
 | `DATASET_SPAWN_RADIUS_M` | `80.0` | Outer spawn radius |
@@ -258,6 +268,16 @@ All optional; set before `run_sim.sh` / `Start.py` / a script. Booleans accept `
 | `DATASET_KEEP_TRAFFIC_RUNNING` | `0` | Keep spawned vehicles after the script exits |
 | `DATASET_KEEP_PEDESTRIANS_RUNNING` | `0` | Keep pedestrians after exit |
 | `DATASET_KEEP_SENSORS_RUNNING` | `0` (test sets `1`) | Keep sensors alive when sharing a console |
+
+Fleet class fractions (`DATASET_VEHICLE_TRUCK_FRACTION`, `DATASET_VEHICLE_MOTORCYCLE_FRACTION`,
+`DATASET_VEHICLE_BICYCLE_FRACTION`) are clamped to `[0, 1]`. Motorcycle and bicycle totals are
+clamped first, then truck; the remainder is cars. Bicycles are split by
+`DATASET_BICYCLE_SIDEWALK_FRACTION` (default `0.5`): half on the corridor sidewalk/crosswalk
+(kinematic path follow) and half on the road (Traffic Manager). Used at initial spawn,
+recirculation (road share only), and the sidewalk manager recycle loop.
+
+See **`DatasetCreation/VALIDATION.md`** for the end-to-end fleet validation checklist
+(motorcycles + bicycles, 50/50 road/sidewalk).
 
 ### Traffic lights
 

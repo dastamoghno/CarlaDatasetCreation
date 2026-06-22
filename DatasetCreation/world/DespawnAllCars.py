@@ -27,30 +27,24 @@ def despawn_pedestrians(world):
 
 def despawn_all_cars(world):
     destroyed_cars = 0
-    skipped_motorcycles = 0
     for actor in world.get_actors().filter("vehicle.*"):
         try:
             if not actor.is_alive:
-                continue
-            type_id = actor.type_id.lower()
-            if "motorcycle" in type_id or "vespa" in type_id or "yamaha" in type_id:
-                skipped_motorcycles += 1
                 continue
             if actor.destroy():
                 destroyed_cars += 1
         except RuntimeError:
             continue
 
-    return destroyed_cars, skipped_motorcycles
+    return destroyed_cars
 
 
 def main():
     _, world = get_world()
 
-    destroyed_cars, skipped_motorcycles = despawn_all_cars(world)
+    destroyed_cars = despawn_all_cars(world)
     destroyed_peds = despawn_pedestrians(world)
-    print(f"Destroyed cars: {destroyed_cars}")
-    print(f"Skipped motorcycles: {skipped_motorcycles}")
+    print(f"Destroyed vehicles: {destroyed_cars}")
     print(f"Destroyed pedestrians/controllers: {destroyed_peds}")
 
 
