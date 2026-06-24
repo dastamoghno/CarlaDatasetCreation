@@ -287,7 +287,7 @@ def label_radar_capture_dir(
                 row["matched_actor_class"] = label["actor_class"]
                 if label["match_bbox_margin_m"] is not None:
                     row["matched_actor_bbox_margin_m"] = f"{label['match_bbox_margin_m']:.6f}"
-                if label["actor_kind"] == "vehicle":
+                if label["actor_kind"] in ("vehicle", "two_wheeler"):
                     row["matched_vehicle_id"] = row["matched_actor_id"]
                     row["matched_vehicle_type_id"] = label["actor_type_id"]
                     row["matched_vehicle_class"] = label["actor_class"]

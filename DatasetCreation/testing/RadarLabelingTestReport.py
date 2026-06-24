@@ -311,8 +311,8 @@ class LabelingStatsCollector:
                         self._frame_vehicle_sensors[(rec.frame, aid)].add(sl)
                     if rec.actor_class:
                         self.points_by_actor_class[rec.actor_class] += 1
-                        if rec.actor_kind == "vehicle":
-                            self.points_by_vehicle_class[rec.actor_class] += 1
+                    if rec.actor_kind in ("vehicle", "two_wheeler"):
+                        self.points_by_vehicle_class[rec.actor_class] += 1
             else:
                 self.failed_match += 1
                 bucket["failed_match"] += 1

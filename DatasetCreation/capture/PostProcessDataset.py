@@ -697,7 +697,7 @@ def post_process_capture_dir(
                             row["rcs_dBsm"] = ""
                     except ValueError:
                         row["rcs_dBsm"] = ""
-                elif kind in ("vehicle", "pedestrian"):
+                elif kind in ("vehicle", "pedestrian", "two_wheeler"):
                     # Dynamic actor without a usable rcs_proxy_m2 — leave blank.
                     row["rcs_dBsm"] = ""
                 else:
@@ -753,7 +753,7 @@ def post_process_capture_dir(
                         # Static returns bypass SNR gating (their RCS is already a
                         # post-CFAR sample); dynamics keep the physical threshold.
                         thr = (fmcw_snr_threshold_db
-                               if kind in ("vehicle", "pedestrian")
+                               if kind in ("vehicle", "pedestrian", "two_wheeler")
                                else fmcw_snr_threshold_static_db)
                         if snr_dB_val >= thr:
                             snr_ok = rng.random() < fmcw_p_detect

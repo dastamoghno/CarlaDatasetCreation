@@ -351,6 +351,19 @@ def _snapshot_from_actor(actor, kind: str, class_label: str) -> dict | None:
     }
 
 
+_TWO_WHEELER_CLASSES = frozenset({"bicycle", "motorcycle"})
+
+
+def _actor_kind_from_class(class_label: str) -> str:
+    """Map a vehicle class label to its actor kind.
+
+    Bicycles and motorcycles become ``"two_wheeler"`` so they are tracked as a
+    distinct category in the labeled CSV and downstream post-processing. All
+    other vehicle blueprints remain ``"vehicle"``.
+    """
+    return "two_wheeler" if class_label in _TWO_WHEELER_CLASSES else "vehicle"
+
+
 def get_radar_target_snapshots(world):
     """Vehicles and pedestrians (walkers) eligible for radar point labeling.
 
@@ -359,8 +372,9 @@ def get_radar_target_snapshots(world):
     """
     snapshots = []
     for vehicle in world.get_actors().filter("vehicle.*"):
+        class_label = vehicle_class_from_type_id(vehicle.type_id)
         snap = _snapshot_from_actor(
-            vehicle, "vehicle", vehicle_class_from_type_id(vehicle.type_id)
+            vehicle, _actor_kind_from_class(class_label), class_label
         )
         if snap is not None:
             snapshots.append(snap)
@@ -403,8 +417,8 @@ def make_fast_tick_snapshot_fn(world):
     def _build_meta(actor) -> dict | None:
         type_id = actor.type_id
         if type_id.startswith("vehicle."):
-            kind = "vehicle"
             class_label = vehicle_class_from_type_id(type_id)
+            kind = _actor_kind_from_class(class_label)
         elif type_id.startswith("walker.pedestrian."):
             if is_bicycle_nav_pilot(actor):
                 return None
@@ -1823,7 +1837,7 @@ def process_radar_measurement_for_capture(
             matched_actor_class = label["actor_class"]
             if label["match_bbox_margin_m"] is not None:
                 matched_actor_bbox_margin = f"{label['match_bbox_margin_m']:.6f}"
-            if label["actor_kind"] == "vehicle":
+            if label["actor_kind"] in ("vehicle", "two_wheeler"):
                 matched_vehicle_id = matched_actor_id
                 matched_vehicle_type_id = matched_actor_type_id
                 matched_vehicle_class = matched_actor_class
@@ -2329,7 +2343,7 @@ def main():
                 nearby_kinds = ";".join(a["kind"] for a in nearby_actors)
                 nearby_classes = ";".join(a["class_label"] for a in nearby_actors)
 
-                nearby_vehicles = [a for a in nearby_actors if a["kind"] == "vehicle"]
+                nearby_vehicles = [a for a in nearby_actors if a["kind"] in ("vehicle", "two_wheeler")]
                 nearby_peds = [a for a in nearby_actors if a["kind"] == "pedestrian"]
                 nearest_vehicle = nearby_vehicles[0] if nearby_vehicles else None
                 nearest_ped = nearby_peds[0] if nearby_peds else None

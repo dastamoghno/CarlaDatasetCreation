@@ -11,6 +11,10 @@ by M), so they are pinned per campaign, not sampled. Everything M-safe is varied
   the crossing-band x-position (slid across the radar zone to decorrelate ped position
   from class), and the traffic-light regime (green-wave vs automatic cycle).
 
+Label taxonomy: bicycles and motorcycles are assigned ``matched_actor_kind="two_wheeler"``
+(distinct from ``"vehicle"``) by the labeling pipeline so that two-wheeler density can be
+tracked independently in QA and BEV video output.
+
 Each run auto-stops (DATASET_CAPTURE_DURATION_S), auto-labels and auto-post-processes
 (canonical PostProcessDataset realism), then the launcher tears down the pipeline (CARLA
 server is left up) and starts the next config. A manifest CSV records run -> config -> dir.
@@ -64,7 +68,8 @@ FIXED_ENV = {
     "DATASET_LABEL_RADAR_AFTER_CAPTURE":"1",
     "DATASET_POSTPROCESS_AFTER_CAPTURE":"1",
     "DATASET_AUTOMATIC_TRAFFIC_LIGHTS": "1",    # lights cycle so the corridor flows
-    "DATASET_VEHICLE_BICYCLE_FRACTION": "0.08", # ensure 2-wheelers in every campaign run
+    # Two-wheeler (bicycle + motorcycle) fractions are swept by CONT_AXES above
+    # (bicycle 2-10%, motorcycle 3-15%) — no need to override them here.
     "DATASET_BICYCLE_SIDEWALK_SPEED_MPS": "1.6",
     # Pinned rig geometry (not swept): low mount + shallow tilt; VFOV per user.
     "DATASET_RIG_HEIGHT_M":             "3",

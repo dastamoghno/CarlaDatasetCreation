@@ -43,12 +43,16 @@ SPAWN_RADIUS_M = 100.0
 # the short corridor + 30 km/h can stop-and-go if pushed too far, but with the drive-in
 # spread ~30 keeps a denser stream flowing. Override via DATASET_TARGET_CAR_COUNT.
 TARGET_CAR_COUNT = 30
-# Fleet class fractions (car = remainder). DATASET_TARGET_CAR_COUNT is total fleet
-# size across all types (legacy name). Override via DATASET_VEHICLE_*_FRACTION or
-# derive truck share from DATASET_TARGET_TRUCK_COUNT.
+# Fleet class fractions and counts.
+# Trucks: fraction of the car+truck sub-fleet. Override via DATASET_VEHICLE_TRUCK_FRACTION.
+# Two-wheelers: independent absolute counts added on top of DATASET_TARGET_CAR_COUNT.
+# Override via DATASET_MOTORCYCLE_COUNT / DATASET_BICYCLE_COUNT (count mode, default),
+# or via DATASET_VEHICLE_MOTORCYCLE_FRACTION / DATASET_VEHICLE_BICYCLE_FRACTION (fraction
+# mode — used by run_campaign.py sweeps; active only when a fraction var is set and no
+# count var is set).
 DEFAULT_TRUCK_FRACTION = 0.10
-DEFAULT_MOTORCYCLE_FRACTION = 0.0
-DEFAULT_BICYCLE_FRACTION = 0.0
+DEFAULT_MOTORCYCLE_COUNT = 10
+DEFAULT_BICYCLE_COUNT = 10   # road + sidewalk combined; split by DATASET_BICYCLE_SIDEWALK_FRACTION (default 0.5 → 5 road, 5 sidewalk)
 DEFAULT_BICYCLE_ROAD_SPEED_REDUCTION_PCT = 40.0
 DEFAULT_MOTORCYCLE_ROAD_SPEED_REDUCTION_PCT = 0.0
 TWO_WHEELER_SPAWN_ATTEMPTS = 3
@@ -808,7 +812,8 @@ def get_fleet_blueprint_pools(world):
     return car_bps, truck_bps, motorcycle_bps, bicycle_bps
 
 
-def motorcycle_fraction_from_env(default=DEFAULT_MOTORCYCLE_FRACTION) -> float:
+def motorcycle_fraction_from_env(default: float = 0.0) -> float:
+    """Legacy fraction mode only. Read DATASET_VEHICLE_MOTORCYCLE_FRACTION."""
     raw = os.environ.get("DATASET_VEHICLE_MOTORCYCLE_FRACTION", "").strip()
     if raw:
         try:
@@ -818,7 +823,8 @@ def motorcycle_fraction_from_env(default=DEFAULT_MOTORCYCLE_FRACTION) -> float:
     return default
 
 
-def bicycle_fraction_from_env(default=DEFAULT_BICYCLE_FRACTION) -> float:
+def bicycle_fraction_from_env(default: float = 0.0) -> float:
+    """Legacy fraction mode only. Read DATASET_VEHICLE_BICYCLE_FRACTION."""
     raw = os.environ.get("DATASET_VEHICLE_BICYCLE_FRACTION", "").strip()
     if raw:
         try:
@@ -828,16 +834,112 @@ def bicycle_fraction_from_env(default=DEFAULT_BICYCLE_FRACTION) -> float:
     return default
 
 
-def fleet_fractions_from_env() -> dict[str, float]:
-    """Return fleet fractions summing to 1.0.
+def motorcycle_count_from_env(default: int = DEFAULT_MOTORCYCLE_COUNT) -> int:
+    """Absolute motorcycle count, independent of DATASET_TARGET_CAR_COUNT.
 
-    ``bicycle`` is the road/TM share; ``bicycle_sidewalk`` is the kinematic sidewalk
-    share. Together they equal DATASET_VEHICLE_BICYCLE_FRACTION (default split 50/50).
-    Clamp motorcycle + total bicycle first, then truck; remainder is cars."""
+    Set DATASET_MOTORCYCLE_COUNT to override. Set to 0 to spawn no motorcycles.
+    Ignored in fraction mode (see _using_count_mode).
+    """
+    raw = os.environ.get("DATASET_MOTORCYCLE_COUNT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def bicycle_count_from_env(default: int = DEFAULT_BICYCLE_COUNT) -> int:
+    """Total bicycle count (road + sidewalk), independent of DATASET_TARGET_CAR_COUNT.
+
+    The road/sidewalk split is controlled by DATASET_BICYCLE_SIDEWALK_FRACTION
+    (default 0.5 → 50/50). Set DATASET_BICYCLE_COUNT to override.
+    Ignored in fraction mode (see _using_count_mode).
+    """
+    raw = os.environ.get("DATASET_BICYCLE_COUNT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def _using_count_mode() -> bool:
+    """True when absolute-count env vars are active (the default when no fraction vars set).
+
+    Count mode: DATASET_MOTORCYCLE_COUNT / DATASET_BICYCLE_COUNT drive two-wheeler
+    fleet size independently of DATASET_TARGET_CAR_COUNT.
+
+    Fraction mode (legacy / campaign): active only when DATASET_VEHICLE_MOTORCYCLE_FRACTION
+    or DATASET_VEHICLE_BICYCLE_FRACTION is explicitly set AND neither count var is set.
+    This keeps run_campaign.py fraction sweeps backward-compatible.
+    """
+    mc_count_set = bool(os.environ.get("DATASET_MOTORCYCLE_COUNT", "").strip())
+    bk_count_set = bool(os.environ.get("DATASET_BICYCLE_COUNT", "").strip())
+    mc_frac_set  = bool(os.environ.get("DATASET_VEHICLE_MOTORCYCLE_FRACTION", "").strip())
+    bk_frac_set  = bool(os.environ.get("DATASET_VEHICLE_BICYCLE_FRACTION", "").strip())
+    return mc_count_set or bk_count_set or not (mc_frac_set or bk_frac_set)
+
+
+def _tm_fleet_target() -> int:
+    """Total TM-managed fleet size: cars + trucks + motorcycles + road bicycles.
+
+    In count mode this is target_car_count + motorcycle_count + road_bicycle_count;
+    in legacy fraction mode it equals target_car_count_from_env() (fractions of total).
+    """
+    if _using_count_mode():
+        car_target = target_car_count_from_env()
+        mc = motorcycle_count_from_env()
+        bk = bicycle_count_from_env()
+        share = bicycle_sidewalk_share_from_env()
+        road_bk = round(bk * (1.0 - share))
+        return car_target + mc + road_bk
+    return target_car_count_from_env()
+
+
+def fleet_fractions_from_env() -> dict[str, float]:
+    """Return fleet fractions of the TM-managed fleet, summing to 1.0.
+
+    Count mode (default when no fraction vars are set):
+      Motorcycles and bicycles are absolute counts (DATASET_MOTORCYCLE_COUNT /
+      DATASET_BICYCLE_COUNT) added on top of DATASET_TARGET_CAR_COUNT (cars+trucks).
+      Fractions are derived from those counts relative to the total TM fleet:
+        total_tm = car_target + motorcycle_count + road_bicycle_count
+      Sidewalk bicycles are managed separately by BicycleSidewalkManager.
+
+    Fraction mode (legacy / run_campaign.py sweeps):
+      Active only when DATASET_VEHICLE_MOTORCYCLE_FRACTION or
+      DATASET_VEHICLE_BICYCLE_FRACTION is explicitly set AND neither count var is set.
+      ``bicycle`` is the road/TM share; ``bicycle_sidewalk`` is the kinematic sidewalk
+      share. Together they equal DATASET_VEHICLE_BICYCLE_FRACTION.
+    """
+    sidewalk_share = bicycle_sidewalk_share_from_env()
+    if _using_count_mode():
+        car_target = target_car_count_from_env()
+        mc = motorcycle_count_from_env()
+        bk = bicycle_count_from_env()
+        road_bk = round(bk * (1.0 - sidewalk_share))
+        sw_bk = bk - road_bk
+        total = car_target + mc + road_bk  # TM fleet (sidewalk bikes are separate)
+        if total <= 0:
+            return {"car": 1.0, "truck": 0.0, "motorcycle": 0.0,
+                    "bicycle": 0.0, "bicycle_sidewalk": 0.0, "bicycle_total": 0.0}
+        truck_n = max(0, round(car_target * truck_fraction_from_env()))
+        car_n = max(0, car_target - truck_n)
+        bk_total = (road_bk + sw_bk) / (total + sw_bk) if (total + sw_bk) > 0 else 0.0
+        return {
+            "car":              car_n / total,
+            "truck":            truck_n / total,
+            "motorcycle":       mc / total,
+            "bicycle":          road_bk / total,
+            "bicycle_sidewalk": sw_bk / total,   # informational; sidewalk_bicycle_target_count uses count directly
+            "bicycle_total":    bk_total,
+        }
+    # Legacy fraction mode (run_campaign.py sets DATASET_VEHICLE_*_FRACTION)
     motorcycle = motorcycle_fraction_from_env()
     bicycle_total = bicycle_fraction_from_env()
     truck = truck_fraction_from_env()
-    sidewalk_share = bicycle_sidewalk_share_from_env()
     motorcycle = max(0.0, min(1.0, motorcycle))
     bicycle_total = max(0.0, min(1.0, bicycle_total))
     if motorcycle + bicycle_total > 1.0:
@@ -859,20 +961,41 @@ def fleet_fractions_from_env() -> dict[str, float]:
 
 
 def sidewalk_bicycle_target_count(fleet_target: int, fractions: dict[str, float]) -> int:
+    if _using_count_mode():
+        bk = bicycle_count_from_env()
+        share = bicycle_sidewalk_share_from_env()
+        return max(0, round(bk * share))
     return max(0, round(fleet_target * fractions.get("bicycle_sidewalk", 0.0)))
 
 
 def log_fleet_mix_requested(fractions: dict[str, float]) -> None:
-    bt = fractions.get("bicycle_total", fractions["bicycle"])
     share = bicycle_sidewalk_share_from_env()
-    print(
-        f"Fleet mix (requested): car={fractions['car']:.1%} "
-        f"truck={fractions['truck']:.1%} "
-        f"motorcycle={fractions['motorcycle']:.1%} "
-        f"bicycle={bt:.1%} (road={fractions['bicycle']:.1%} "
-        f"sidewalk={fractions.get('bicycle_sidewalk', 0.0):.1%}, split={share:.0%})",
-        flush=True,
-    )
+    if _using_count_mode():
+        car_target = target_car_count_from_env()
+        mc = motorcycle_count_from_env()
+        bk = bicycle_count_from_env()
+        road_bk = round(bk * (1.0 - share))
+        sw_bk = bk - road_bk
+        total_tm = _tm_fleet_target()
+        print(
+            f"Fleet mix (requested, count mode): "
+            f"car+truck={car_target} motorcycle={mc} "
+            f"bicycle={bk} (road={road_bk} sidewalk={sw_bk}, split={share:.0%}) "
+            f"| TM fleet={total_tm} + {sw_bk} sidewalk bikes "
+            f"[{fractions['car']:.1%} car, {fractions['truck']:.1%} truck, "
+            f"{fractions['motorcycle']:.1%} mc, {fractions['bicycle']:.1%} road-bike]",
+            flush=True,
+        )
+    else:
+        bt = fractions.get("bicycle_total", fractions["bicycle"])
+        print(
+            f"Fleet mix (requested): car={fractions['car']:.1%} "
+            f"truck={fractions['truck']:.1%} "
+            f"motorcycle={fractions['motorcycle']:.1%} "
+            f"bicycle={bt:.1%} (road={fractions['bicycle']:.1%} "
+            f"sidewalk={fractions.get('bicycle_sidewalk', 0.0):.1%}, split={share:.0%})",
+            flush=True,
+        )
 
 
 def log_fleet_class_summary(world, spawned_ids, *, label: str) -> None:
@@ -1192,11 +1315,12 @@ def try_spawn_cars(
             continue
 
         spawned_ids.append(actor.id)
-        label = f"CAR {len(spawned_ids):02d}"
+        _vtype = vehicle_class_from_type_id(bp.id).upper()
+        label = f"{_vtype} {len(spawned_ids):02d}"
         labeled_actors.append((actor, label))
         print(
-            f"Spawned {len(spawned_ids)}/{target_count} "
-            f"(actor_id={actor.id}) after {delay_s:.2f}s delay. "
+            f"Spawned {len(spawned_ids)}/{target_count} TM "
+            f"(actor_id={actor.id}, type={_vtype}) after {delay_s:.2f}s delay. "
             f"autopilot=on, driving={'free' if free_vehicle_driving_from_env() else 'lane_keep'}, "
             f"label={label}, "
             f"cleared_spawn>={move_away_distance_m:.1f}m"
@@ -1237,7 +1361,7 @@ def main():
         traffic_manager=client.get_trafficmanager(TRAFFIC_MANAGER_PORT),
         center_index=spawn_center_index_from_env(),
         spawn_radius_m=spawn_radius_m_from_env(),
-        target_count=target_car_count_from_env(),
+        target_count=_tm_fleet_target(),
     )
 
     print(f"Spawn point total on map: {spawn_point_total}")
@@ -1269,11 +1393,22 @@ def main():
         f"Spawn gating: next spawn waits until previous moved "
         f">={move_away_distance_m:.1f} m (timeout {move_away_timeout_s:.1f}s)"
     )
-    print(f"Requested cars: {target_car_count_from_env()}")
+    if _using_count_mode():
+        _mc  = motorcycle_count_from_env()
+        _bk  = bicycle_count_from_env()
+        _sw  = round(_bk * bicycle_sidewalk_share_from_env())
+        _rbk = _bk - _sw
+        _ct  = target_car_count_from_env()
+        print(
+            f"Requested: {_ct} cars+trucks + {_mc} motorcycles + {_rbk} road bikes (TM fleet: {_ct + _mc + _rbk})"
+            f" + {_sw} sidewalk bikes (BicycleSidewalkManager) = {_ct + _mc + _bk} total"
+        )
+    else:
+        print(f"Requested fleet: {target_car_count_from_env()} (fraction mode)")
     print(f"Successfully spawned: {count}")
 
     fractions = fleet_fractions_from_env()
-    sw_target = sidewalk_bicycle_target_count(target_car_count_from_env(), fractions)
+    sw_target = sidewalk_bicycle_target_count(_tm_fleet_target(), fractions)
     sidewalk_manager = None
     if sw_target > 0:
         _, _, _, bicycle_bps = get_fleet_blueprint_pools(world)
