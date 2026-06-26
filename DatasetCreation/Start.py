@@ -346,26 +346,68 @@ def _on_term_signal(signum, frame):
     raise KeyboardInterrupt
 
 
-def stop_all(processes: list[subprocess.Popen], timeout_s: float = 5.0) -> None:
+def _send_graceful_interrupt(process: subprocess.Popen) -> None:
+    """Ask a child script to raise KeyboardInterrupt so its finally blocks run.
+
+    Unix: SIGINT. Windows: CTRL_C_EVENT (requires CREATE_NEW_PROCESS_GROUP at spawn).
+    """
+    if process.poll() is not None:
+        return
+    sig = signal.CTRL_C_EVENT if sys.platform == "win32" else signal.SIGINT
+    try:
+        process.send_signal(sig)
+    except (ProcessLookupError, OSError, ValueError):
+        pass
+
+
+def stop_all(
+    processes: list[subprocess.Popen],
+    timeout_s: float = 5.0,
+    *,
+    force: bool = False,
+) -> None:
     """Stop child scripts, letting each run its own cleanup first.
 
     SIGINT is sent before terminate()/kill() so every script hits its
     KeyboardInterrupt/finally path and destroys the actors it spawned (radars,
     walkers, ...). Plain terminate() (SIGTERM) skips those finally blocks, which is
     what kept orphaning dataset radars in the world across runs.
+
+    On Windows, console signals to CREATE_NEW_PROCESS_GROUP children are unreliable,
+    so we terminate() directly (Start.py still runs despawn + sensor cleanup after).
     """
     if not processes:
         return
 
-    print("\nStopping all scripts...")
+    print("\nStopping all scripts...", flush=True)
 
-    # 1) Graceful: SIGINT → each script's finally destroys its actors.
+    if sys.platform == "win32" or force:
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+        wait_budget = 8.0 if force else timeout_s
+        deadline = time() + wait_budget
+        while time() < deadline:
+            if all(p.poll() is not None for p in processes):
+                break
+            sleep(0.25)
+        for process in processes:
+            if process.poll() is None:
+                print(f"  - Force killing PID {process.pid}", flush=True)
+                try:
+                    process.kill()
+                    process.wait()
+                except OSError:
+                    pass
+        print("All scripts stopped.", flush=True)
+        return
+
+    # 1) Graceful: interrupt → each script's finally destroys its actors.
     for process in processes:
-        if process.poll() is None:
-            try:
-                process.send_signal(signal.SIGINT)
-            except (ProcessLookupError, OSError):
-                pass
+        _send_graceful_interrupt(process)
     for process in processes:
         if process.poll() is None:
             try:
@@ -390,14 +432,14 @@ def stop_all(processes: list[subprocess.Popen], timeout_s: float = 5.0) -> None:
     # 3) Last resort: SIGKILL.
     for process in processes:
         if process.poll() is None:
-            print(f"  - Force killing PID {process.pid}")
+            print(f"  - Force killing PID {process.pid}", flush=True)
             try:
                 process.kill()
                 process.wait()
             except OSError:
                 pass
 
-    print("All scripts stopped.")
+    print("All scripts stopped.", flush=True)
 
 
 def destroy_leftover_dataset_sensors(dc_root: Path) -> None:
@@ -503,8 +545,12 @@ def launch_scripts(
             "env": child_env,
             "cwd": str(dc_root),
         }
-        if script.name == "TrafficLightControl.py" and sys.platform == "win32":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        if sys.platform == "win32":
+            if script.name == "TrafficLightControl.py":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            else:
+                # So _send_graceful_interrupt can deliver CTRL_C_EVENT on stop.
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         process = subprocess.Popen(
             [sys.executable, str(script)],
             **popen_kwargs,
@@ -709,6 +755,10 @@ def main() -> None:
     processes = launch_scripts(scripts, dc_root, child_env, test_mode=test_mode)
 
     print("All scripts started. Press Ctrl+C to stop all.")
+    print(
+        "  (Ctrl+C again during shutdown skips waiting and stops child scripts immediately.)",
+        flush=True,
+    )
 
     is_test_mode = run_mode == "test"
     live_stats_key: tuple[int, str] | None = None
@@ -722,98 +772,107 @@ def main() -> None:
                     last_live_poll = now
             sleep(0.25)
     except KeyboardInterrupt:
-        if is_test_mode:
-            out_dir = request_test_labeling_stop(dc_root)
-            if out_dir is not None:
-                print(
-                    f"\nRequested TestRadarLabeling to stop and save to:\n  {out_dir}",
-                    flush=True,
-                )
-                print(
-                    f"Waiting up to {TEST_LABELING_WAIT_S:.0f}s for final report...",
-                    flush=True,
-                )
-                labeling_proc = next(
+        print("\nShutdown requested (Ctrl+C)...", flush=True)
+        force_stop = False
+        try:
+            if is_test_mode:
+                out_dir = request_test_labeling_stop(dc_root)
+                if out_dir is not None:
+                    print(
+                        f"\nRequested TestRadarLabeling to stop and save to:\n  {out_dir}",
+                        flush=True,
+                    )
+                    print(
+                        f"Waiting up to {TEST_LABELING_WAIT_S:.0f}s for final report "
+                        "(Ctrl+C again to skip)...",
+                        flush=True,
+                    )
+                    labeling_proc = next(
+                        (
+                            p
+                            for p in processes
+                            if p.poll() is None and p.args and "TestRadarLabeling" in p.args[-1]
+                        ),
+                        None,
+                    )
+                    try:
+                        if wait_for_test_labeling_export(out_dir, timeout_s=TEST_LABELING_WAIT_S):
+                            if labeling_proc is not None:
+                                try:
+                                    labeling_proc.wait(timeout=15.0)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                            print_test_labeling_summaries(out_dir)
+                        else:
+                            print(
+                                "Timed out waiting for final report. Partial outputs may exist; "
+                                "check live_stats.json and the folder above.",
+                                flush=True,
+                            )
+                            print_test_labeling_summaries(out_dir)
+                    except KeyboardInterrupt:
+                        force_stop = True
+                        print("\nSecond Ctrl+C — skipping report wait.", flush=True)
+            else:
+                # CaptureRadarCameraData.py also received CTRL_C from the console and is
+                # already running its finally block: drain radar queue (up to 30s) →
+                # export extrinsics → stop sensors → run offline labeling
+                # (LabelRadarCapture.label_radar_capture_dir, ~10-30s on a long run).
+                # We MUST wait for it to exit on its own — calling stop_all() right away
+                # would TerminateProcess it on Windows and skip the offline labeling step,
+                # which is exactly the bug that left captures with no radar_data_labeled.csv.
+                capture_proc = next(
                     (
                         p
                         for p in processes
-                        if p.poll() is None and p.args and "TestRadarLabeling" in p.args[-1]
+                        if p.args and "CaptureRadarCameraData" in str(p.args[-1])
                     ),
                     None,
                 )
-                if wait_for_test_labeling_export(out_dir, timeout_s=TEST_LABELING_WAIT_S):
-                    if labeling_proc is not None:
-                        try:
-                            labeling_proc.wait(timeout=15.0)
-                        except subprocess.TimeoutExpired:
-                            pass
-                    print_test_labeling_summaries(out_dir)
-                else:
+                if capture_proc is not None and capture_proc.poll() is None:
+                    # Explicitly tell the capture to finalize (drain → extrinsics → offline
+                    # labeling). Don't assume it already got a console Ctrl+C — under a
+                    # background launch only THIS process may have been signalled.
+                    _send_graceful_interrupt(capture_proc)
+                    capture_wait_s = _estimate_capture_wait_s(dc_root)
                     print(
-                        "Timed out waiting for final report. Partial outputs may exist; "
-                        "check live_stats.json and the folder above.",
+                        "\nWaiting for CaptureRadarCameraData to finish "
+                        "(drain queue + extrinsics + offline labeling). "
+                        f"Up to {capture_wait_s:.0f}s — Ctrl+C again to skip.",
                         flush=True,
                     )
-                    print_test_labeling_summaries(out_dir)
-            stop_all(processes, timeout_s=12.0)
-        else:
-            # CaptureRadarCameraData.py also received CTRL_C from the console and is
-            # already running its finally block: drain radar queue (up to 30s) →
-            # export extrinsics → stop sensors → run offline labeling
-            # (LabelRadarCapture.label_radar_capture_dir, ~10-30s on a long run).
-            # We MUST wait for it to exit on its own — calling stop_all() right away
-            # would TerminateProcess it on Windows and skip the offline labeling step,
-            # which is exactly the bug that left captures with no radar_data_labeled.csv.
-            capture_proc = next(
-                (
-                    p
-                    for p in processes
-                    if p.args and "CaptureRadarCameraData" in str(p.args[-1])
-                ),
-                None,
-            )
-            if capture_proc is not None and capture_proc.poll() is None:
-                # Explicitly tell the capture to finalize (drain → extrinsics → offline
-                # labeling). Don't assume it already got a console Ctrl+C — under a
-                # background launch only THIS process may have been signalled.
-                try:
-                    capture_proc.send_signal(signal.SIGINT)
-                except (ProcessLookupError, OSError):
-                    pass
-                capture_wait_s = _estimate_capture_wait_s(dc_root)
-                print(
-                    "\nWaiting for CaptureRadarCameraData to finish "
-                    "(drain queue + extrinsics + offline labeling). "
-                    f"Up to {capture_wait_s:.0f}s — DO NOT close this window.",
-                    flush=True,
-                )
-                try:
-                    capture_proc.wait(timeout=capture_wait_s)
-                    print(
-                        "Capture process exited cleanly. "
-                        "Check the run folder for radar_data_labeled.csv.",
-                        flush=True,
-                    )
-                except subprocess.TimeoutExpired:
-                    run_dir = _resolve_last_capture_dir(dc_root)
-                    hint = (
-                        f"--capture-dir \"{run_dir}\""
-                        if run_dir
-                        else "--capture-dir <run folder>"
-                    )
-                    print(
-                        f"Capture still running after {capture_wait_s:.0f}s; "
-                        "terminating. If radar_data_labeled.csv is missing, run:\n"
-                        f"  python -m capture.LabelRadarCapture {hint}",
-                        flush=True,
-                    )
-            # Capture handles its own extrinsics export in its finally block while
-            # sensors are still alive in the world, so we no longer call
-            # export_dataset_extrinsics_in_process here — by the time we got to it,
-            # RadarCameraSetup* had already destroyed the sensors and the call failed.
-            stop_all(processes)
-        despawn_all_cars(dc_root)
-        destroy_leftover_dataset_sensors(dc_root)
+                    try:
+                        capture_proc.wait(timeout=capture_wait_s)
+                        print(
+                            "Capture process exited cleanly. "
+                            "Check the run folder for radar_data_labeled.csv.",
+                            flush=True,
+                        )
+                    except KeyboardInterrupt:
+                        force_stop = True
+                        print("\nSecond Ctrl+C — stopping capture wait.", flush=True)
+                    except subprocess.TimeoutExpired:
+                        run_dir = _resolve_last_capture_dir(dc_root)
+                        hint = (
+                            f"--capture-dir \"{run_dir}\""
+                            if run_dir
+                            else "--capture-dir <run folder>"
+                        )
+                        print(
+                            f"Capture still running after {capture_wait_s:.0f}s; "
+                            "terminating. If radar_data_labeled.csv is missing, run:\n"
+                            f"  python -m capture.LabelRadarCapture {hint}",
+                            flush=True,
+                        )
+                # Capture handles its own extrinsics export in its finally block while
+                # sensors are still alive in the world, so we no longer call
+                # export_dataset_extrinsics_in_process here — by the time we got to it,
+                # RadarCameraSetup* had already destroyed the sensors and the call failed.
+        finally:
+            stop_all(processes, timeout_s=12.0, force=force_stop)
+            despawn_all_cars(dc_root)
+            destroy_leftover_dataset_sensors(dc_root)
+            print("Shutdown complete.", flush=True)
 
 
 if __name__ == "__main__":

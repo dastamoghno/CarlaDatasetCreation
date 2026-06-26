@@ -92,7 +92,7 @@ with radar_csv.open(newline="", encoding="utf-8") as rf:
         hist[b] += 1
         # kind of the nearest candidate (for veh-only view)
         kinds = {a.get("kind") for a in cands}
-        if "vehicle" in kinds:
+        if kinds & {"vehicle", "two_wheeler"}:
             hist_veh[b] += 1
         if n_cand % 50000 == 0:
             print(f"  ...{n_cand:,} candidate samples", flush=True)

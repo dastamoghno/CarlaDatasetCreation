@@ -6,10 +6,14 @@ N (10-12). Map (Town10HD_Opt) and radar count are FIXED — varying them would c
 fusion model's input structure (per-sensor positional encoding / topology mask are sized
 by M), so they are pinned per campaign, not sampled. Everything M-safe is varied:
 
-  traffic density / speed / following-gap, truck fraction, crosser count, AI crossing
-  fraction, running fraction, pedestrian spawn spread, the crossing-band x-position
-  (slid across the radar zone to decorrelate ped position from class), and the
-  traffic-light regime (green-wave vs automatic cycle).
+  traffic density / speed / following-gap, truck / motorcycle / bicycle fractions,
+  bicycle sidewalk share (pinned 0.5), crosser count, AI crossing fraction, running fraction, pedestrian spawn spread,
+  the crossing-band x-position (slid across the radar zone to decorrelate ped position
+  from class), and the traffic-light regime (green-wave vs automatic cycle).
+
+Label taxonomy: bicycles and motorcycles are assigned ``matched_actor_kind="two_wheeler"``
+(distinct from ``"vehicle"``) by the labeling pipeline so that two-wheeler density can be
+tracked independently in QA and BEV video output.
 
 Each run auto-stops (DATASET_CAPTURE_DURATION_S), auto-labels and auto-post-processes
 (canonical PostProcessDataset realism), then the launcher tears down the pipeline (CARLA
@@ -44,7 +48,10 @@ CONT_AXES = [
     ("DATASET_TARGET_CAR_COUNT",            12,   36,   "int"),
     ("DATASET_VEHICLE_SPEED_REDUCTION_PCT",  0,   45,   "f1"),
     ("DATASET_SAFE_FOLLOWING_DISTANCE_M",    2.0,  6.0, "f1"),
-    ("DATASET_VEHICLE_TRUCK_FRACTION",       0.05, 0.20,"f2"),
+    ("DATASET_VEHICLE_TRUCK_FRACTION",       0.05, 0.15,"f2"),
+    ("DATASET_VEHICLE_MOTORCYCLE_FRACTION",  0.03, 0.15,"f2"),
+    ("DATASET_VEHICLE_BICYCLE_FRACTION",     0.02, 0.10,"f2"),
+    ("DATASET_BICYCLE_SIDEWALK_FRACTION",    0.3,  0.7, "f2"),
     ("DATASET_PED_CROSSING_COUNT",           0,    8,   "int"),
     ("DATASET_PED_CROSSING_FACTOR",          0.2,  0.8, "f2"),
     ("DATASET_PED_RUNNING_FRACTION",         0.0,  0.4, "f2"),
@@ -61,6 +68,9 @@ FIXED_ENV = {
     "DATASET_LABEL_RADAR_AFTER_CAPTURE":"1",
     "DATASET_POSTPROCESS_AFTER_CAPTURE":"1",
     "DATASET_AUTOMATIC_TRAFFIC_LIGHTS": "1",    # lights cycle so the corridor flows
+    # Two-wheeler (bicycle + motorcycle) fractions are swept by CONT_AXES above
+    # (bicycle 2-10%, motorcycle 3-15%) — no need to override them here.
+    "DATASET_BICYCLE_SIDEWALK_SPEED_MPS": "1.6",
     # Pinned rig geometry (not swept): low mount + shallow tilt; VFOV per user.
     "DATASET_RIG_HEIGHT_M":             "3",
     "DATASET_RADAR_PITCH_DEG":          "8",
@@ -118,6 +128,8 @@ def build_configs(n: int, base_seed: int) -> list[dict]:
 def manifest_rows(configs: list[dict]) -> list[dict]:
     keys = (["DATASET_SEED", "DATASET_TARGET_CAR_COUNT", "DATASET_VEHICLE_SPEED_REDUCTION_PCT",
              "DATASET_SAFE_FOLLOWING_DISTANCE_M", "DATASET_VEHICLE_TRUCK_FRACTION",
+             "DATASET_VEHICLE_MOTORCYCLE_FRACTION", "DATASET_VEHICLE_BICYCLE_FRACTION",
+             "DATASET_BICYCLE_SIDEWALK_FRACTION", "DATASET_BICYCLE_SIDEWALK_SPEED_MPS",
              "DATASET_PED_CROSSING_COUNT", "DATASET_PED_CROSSING_FACTOR",
              "DATASET_PED_RUNNING_FRACTION", "DATASET_PED_SPAWN_RADIUS_M",
              "DATASET_PED_CROSSING_X_MIN", "DATASET_PED_CROSSING_X_MAX",

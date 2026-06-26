@@ -17,6 +17,16 @@ import time
 import carla
 
 from carla_connect import get_world
+from world.bicycle_sidewalk import (
+    BicycleSidewalkManager,
+    bicycle_sidewalk_share_from_env,
+)
+from world.vehicle_classes import (
+    bp_is_bicycle,
+    bp_is_motorcycle,
+    bp_is_truck,
+    vehicle_class_from_type_id,
+)
 
 
 # Primary spawn anchor: map spawn-point index 144 is the monitored corridor
@@ -33,12 +43,19 @@ SPAWN_RADIUS_M = 100.0
 # the short corridor + 30 km/h can stop-and-go if pushed too far, but with the drive-in
 # spread ~30 keeps a denser stream flowing. Override via DATASET_TARGET_CAR_COUNT.
 TARGET_CAR_COUNT = 30
-# Fraction of spawned vehicles that should be trucks. CARLA blueprint pools are
-# car-heavy, so without this trucks are rare (one capture had 1 distinct truck =
-# 30% of all labels — a per-actor memorization shortcut). Recirculation then yields
-# many distinct trucks over a capture. Override via DATASET_VEHICLE_TRUCK_FRACTION
-# or derive from DATASET_TARGET_TRUCK_COUNT.
+# Fleet class fractions and counts.
+# Trucks: fraction of the car+truck sub-fleet. Override via DATASET_VEHICLE_TRUCK_FRACTION.
+# Two-wheelers: independent absolute counts added on top of DATASET_TARGET_CAR_COUNT.
+# Override via DATASET_MOTORCYCLE_COUNT / DATASET_BICYCLE_COUNT (count mode, default),
+# or via DATASET_VEHICLE_MOTORCYCLE_FRACTION / DATASET_VEHICLE_BICYCLE_FRACTION (fraction
+# mode — used by run_campaign.py sweeps; active only when a fraction var is set and no
+# count var is set).
 DEFAULT_TRUCK_FRACTION = 0.10
+DEFAULT_MOTORCYCLE_COUNT = 10
+DEFAULT_BICYCLE_COUNT = 10   # road + sidewalk combined; split by DATASET_BICYCLE_SIDEWALK_FRACTION (default 0.5 → 5 road, 5 sidewalk)
+DEFAULT_BICYCLE_ROAD_SPEED_REDUCTION_PCT = 40.0
+DEFAULT_MOTORCYCLE_ROAD_SPEED_REDUCTION_PCT = 0.0
+TWO_WHEELER_SPAWN_ATTEMPTS = 3
 # Poisson process rate (lambda): expected spawns per second. Higher = fleet fills
 # faster (more cars on the road sooner). Paired with the smaller MOVE_AWAY_DISTANCE_M.
 SPAWN_RATE_PER_SECOND = 1.0
@@ -639,9 +656,9 @@ def recirculate_traffic_until_interrupted(
     client, world = get_world()
     world_map = world.get_map()
     traffic_manager = client.get_trafficmanager(traffic_manager_port)
-    vehicle_bps = get_vehicle_blueprints(world)
-    truck_bps, nontruck_bps = split_truck_bps(vehicle_bps)
-    truck_fraction = truck_fraction_from_env()
+    car_bps, truck_bps, motorcycle_bps, bicycle_bps = get_fleet_blueprint_pools(world)
+    fractions = fleet_fractions_from_env()
+    log_fleet_mix_requested(fractions)
 
     spawn_points = world_map.get_spawn_points()
     center_location = spawn_points[center_index].location
@@ -725,7 +742,9 @@ def recirculate_traffic_until_interrupted(
                 # Respawn at a random drive-in point (retry a few collisions).
                 new_actor = None
                 for transform in random.sample(drive_in_points, min(len(drive_in_points), 8)):
-                    bp = pick_vehicle_bp(truck_bps, nontruck_bps, truck_fraction)
+                    bp = pick_fleet_bp(
+                        car_bps, truck_bps, motorcycle_bps, bicycle_bps, fractions
+                    )
                     if bp.has_attribute("color"):
                         bp.set_attribute(
                             "color",
@@ -734,15 +753,14 @@ def recirculate_traffic_until_interrupted(
                     new_actor = world.try_spawn_actor(bp, transform)
                     if new_actor is not None:
                         try:
-                            new_actor.set_autopilot(True, traffic_manager_port)
-                            if free_vehicle_driving_from_env():
-                                apply_free_driving_policy(
-                                    traffic_manager, new_actor, world_map, transform
-                                )
-                            else:
-                                apply_straight_driving_policy(
-                                    traffic_manager, new_actor, world_map, transform
-                                )
+                            _apply_fleet_autopilot(
+                                traffic_manager,
+                                new_actor,
+                                bp,
+                                world_map,
+                                transform,
+                                traffic_manager_port,
+                            )
                         except (RuntimeError, AttributeError):
                             try:
                                 new_actor.destroy()
@@ -762,34 +780,271 @@ def recirculate_traffic_until_interrupted(
         time.sleep(poll_s)
 
 
-def get_vehicle_blueprints(world):
+def get_fleet_blueprint_pools(world):
+    """Return (car_bps, truck_bps, motorcycle_bps, bicycle_bps) for TM fleet spawning."""
     blueprints = world.get_blueprint_library().filter("vehicle.*")
-    usable = []
+    car_bps, truck_bps, motorcycle_bps, bicycle_bps = [], [], [], []
 
     for bp in blueprints:
         if bp.id.endswith("isetta"):
             continue
+        wheels = None
         if bp.has_attribute("number_of_wheels"):
-            if int(bp.get_attribute("number_of_wheels").as_int()) != 4:
+            wheels = int(bp.get_attribute("number_of_wheels").as_int())
+
+        if bp_is_motorcycle(bp):
+            if wheels is None or wheels == 2:
+                motorcycle_bps.append(bp)
+            continue
+        if bp_is_bicycle(bp):
+            if wheels is None or wheels == 2:
+                bicycle_bps.append(bp)
+            continue
+        if wheels is not None and wheels != 4:
+            continue
+        if bp_is_truck(bp):
+            truck_bps.append(bp)
+        else:
+            car_bps.append(bp)
+
+    if not (car_bps or truck_bps or motorcycle_bps or bicycle_bps):
+        raise RuntimeError("No usable vehicle blueprints found.")
+    return car_bps, truck_bps, motorcycle_bps, bicycle_bps
+
+
+def motorcycle_fraction_from_env(default: float = 0.0) -> float:
+    """Legacy fraction mode only. Read DATASET_VEHICLE_MOTORCYCLE_FRACTION."""
+    raw = os.environ.get("DATASET_VEHICLE_MOTORCYCLE_FRACTION", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError:
+            pass
+    return default
+
+
+def bicycle_fraction_from_env(default: float = 0.0) -> float:
+    """Legacy fraction mode only. Read DATASET_VEHICLE_BICYCLE_FRACTION."""
+    raw = os.environ.get("DATASET_VEHICLE_BICYCLE_FRACTION", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError:
+            pass
+    return default
+
+
+def motorcycle_count_from_env(default: int = DEFAULT_MOTORCYCLE_COUNT) -> int:
+    """Absolute motorcycle count, independent of DATASET_TARGET_CAR_COUNT.
+
+    Set DATASET_MOTORCYCLE_COUNT to override. Set to 0 to spawn no motorcycles.
+    Ignored in fraction mode (see _using_count_mode).
+    """
+    raw = os.environ.get("DATASET_MOTORCYCLE_COUNT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def bicycle_count_from_env(default: int = DEFAULT_BICYCLE_COUNT) -> int:
+    """Total bicycle count (road + sidewalk), independent of DATASET_TARGET_CAR_COUNT.
+
+    The road/sidewalk split is controlled by DATASET_BICYCLE_SIDEWALK_FRACTION
+    (default 0.5 → 50/50). Set DATASET_BICYCLE_COUNT to override.
+    Ignored in fraction mode (see _using_count_mode).
+    """
+    raw = os.environ.get("DATASET_BICYCLE_COUNT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def _using_count_mode() -> bool:
+    """True when absolute-count env vars are active (the default when no fraction vars set).
+
+    Count mode: DATASET_MOTORCYCLE_COUNT / DATASET_BICYCLE_COUNT drive two-wheeler
+    fleet size independently of DATASET_TARGET_CAR_COUNT.
+
+    Fraction mode (legacy / campaign): active only when DATASET_VEHICLE_MOTORCYCLE_FRACTION
+    or DATASET_VEHICLE_BICYCLE_FRACTION is explicitly set AND neither count var is set.
+    This keeps run_campaign.py fraction sweeps backward-compatible.
+    """
+    mc_count_set = bool(os.environ.get("DATASET_MOTORCYCLE_COUNT", "").strip())
+    bk_count_set = bool(os.environ.get("DATASET_BICYCLE_COUNT", "").strip())
+    mc_frac_set  = bool(os.environ.get("DATASET_VEHICLE_MOTORCYCLE_FRACTION", "").strip())
+    bk_frac_set  = bool(os.environ.get("DATASET_VEHICLE_BICYCLE_FRACTION", "").strip())
+    return mc_count_set or bk_count_set or not (mc_frac_set or bk_frac_set)
+
+
+def _tm_fleet_target() -> int:
+    """Total TM-managed fleet size: cars + trucks + motorcycles + road bicycles.
+
+    In count mode this is target_car_count + motorcycle_count + road_bicycle_count;
+    in legacy fraction mode it equals target_car_count_from_env() (fractions of total).
+    """
+    if _using_count_mode():
+        car_target = target_car_count_from_env()
+        mc = motorcycle_count_from_env()
+        bk = bicycle_count_from_env()
+        share = bicycle_sidewalk_share_from_env()
+        road_bk = round(bk * (1.0 - share))
+        return car_target + mc + road_bk
+    return target_car_count_from_env()
+
+
+def fleet_fractions_from_env() -> dict[str, float]:
+    """Return fleet fractions of the TM-managed fleet, summing to 1.0.
+
+    Count mode (default when no fraction vars are set):
+      Motorcycles and bicycles are absolute counts (DATASET_MOTORCYCLE_COUNT /
+      DATASET_BICYCLE_COUNT) added on top of DATASET_TARGET_CAR_COUNT (cars+trucks).
+      Fractions are derived from those counts relative to the total TM fleet:
+        total_tm = car_target + motorcycle_count + road_bicycle_count
+      Sidewalk bicycles are managed separately by BicycleSidewalkManager.
+
+    Fraction mode (legacy / run_campaign.py sweeps):
+      Active only when DATASET_VEHICLE_MOTORCYCLE_FRACTION or
+      DATASET_VEHICLE_BICYCLE_FRACTION is explicitly set AND neither count var is set.
+      ``bicycle`` is the road/TM share; ``bicycle_sidewalk`` is the kinematic sidewalk
+      share. Together they equal DATASET_VEHICLE_BICYCLE_FRACTION.
+    """
+    sidewalk_share = bicycle_sidewalk_share_from_env()
+    if _using_count_mode():
+        car_target = target_car_count_from_env()
+        mc = motorcycle_count_from_env()
+        bk = bicycle_count_from_env()
+        road_bk = round(bk * (1.0 - sidewalk_share))
+        sw_bk = bk - road_bk
+        total = car_target + mc + road_bk  # TM fleet (sidewalk bikes are separate)
+        if total <= 0:
+            return {"car": 1.0, "truck": 0.0, "motorcycle": 0.0,
+                    "bicycle": 0.0, "bicycle_sidewalk": 0.0, "bicycle_total": 0.0}
+        truck_n = max(0, round(car_target * truck_fraction_from_env()))
+        car_n = max(0, car_target - truck_n)
+        bk_total = (road_bk + sw_bk) / (total + sw_bk) if (total + sw_bk) > 0 else 0.0
+        return {
+            "car":              car_n / total,
+            "truck":            truck_n / total,
+            "motorcycle":       mc / total,
+            "bicycle":          road_bk / total,
+            "bicycle_sidewalk": sw_bk / total,   # informational; sidewalk_bicycle_target_count uses count directly
+            "bicycle_total":    bk_total,
+        }
+    # Legacy fraction mode (run_campaign.py sets DATASET_VEHICLE_*_FRACTION)
+    motorcycle = motorcycle_fraction_from_env()
+    bicycle_total = bicycle_fraction_from_env()
+    truck = truck_fraction_from_env()
+    motorcycle = max(0.0, min(1.0, motorcycle))
+    bicycle_total = max(0.0, min(1.0, bicycle_total))
+    if motorcycle + bicycle_total > 1.0:
+        scale = 1.0 / (motorcycle + bicycle_total)
+        motorcycle *= scale
+        bicycle_total *= scale
+    truck = max(0.0, min(1.0 - motorcycle - bicycle_total, truck))
+    car = max(0.0, 1.0 - motorcycle - bicycle_total - truck)
+    road_bike = bicycle_total * (1.0 - sidewalk_share)
+    sw_bike = bicycle_total * sidewalk_share
+    return {
+        "car": car,
+        "truck": truck,
+        "motorcycle": motorcycle,
+        "bicycle": road_bike,
+        "bicycle_sidewalk": sw_bike,
+        "bicycle_total": bicycle_total,
+    }
+
+
+def sidewalk_bicycle_target_count(fleet_target: int, fractions: dict[str, float]) -> int:
+    if _using_count_mode():
+        bk = bicycle_count_from_env()
+        share = bicycle_sidewalk_share_from_env()
+        return max(0, round(bk * share))
+    return max(0, round(fleet_target * fractions.get("bicycle_sidewalk", 0.0)))
+
+
+def log_fleet_mix_requested(fractions: dict[str, float]) -> None:
+    share = bicycle_sidewalk_share_from_env()
+    if _using_count_mode():
+        car_target = target_car_count_from_env()
+        mc = motorcycle_count_from_env()
+        bk = bicycle_count_from_env()
+        road_bk = round(bk * (1.0 - share))
+        sw_bk = bk - road_bk
+        total_tm = _tm_fleet_target()
+        print(
+            f"Fleet mix (requested, count mode): "
+            f"car+truck={car_target} motorcycle={mc} "
+            f"bicycle={bk} (road={road_bk} sidewalk={sw_bk}, split={share:.0%}) "
+            f"| TM fleet={total_tm} + {sw_bk} sidewalk bikes "
+            f"[{fractions['car']:.1%} car, {fractions['truck']:.1%} truck, "
+            f"{fractions['motorcycle']:.1%} mc, {fractions['bicycle']:.1%} road-bike]",
+            flush=True,
+        )
+    else:
+        bt = fractions.get("bicycle_total", fractions["bicycle"])
+        print(
+            f"Fleet mix (requested): car={fractions['car']:.1%} "
+            f"truck={fractions['truck']:.1%} "
+            f"motorcycle={fractions['motorcycle']:.1%} "
+            f"bicycle={bt:.1%} (road={fractions['bicycle']:.1%} "
+            f"sidewalk={fractions.get('bicycle_sidewalk', 0.0):.1%}, split={share:.0%})",
+            flush=True,
+        )
+
+
+def log_fleet_class_summary(world, spawned_ids, *, label: str) -> None:
+    counts: dict[str, int] = {}
+    for actor_id in spawned_ids:
+        try:
+            actor = world.get_actor(actor_id)
+            if actor is None or not actor.is_alive:
                 continue
-        usable.append(bp)
+            cls = vehicle_class_from_type_id(actor.type_id)
+            counts[cls] = counts.get(cls, 0) + 1
+        except RuntimeError:
+            continue
+    total = sum(counts.values())
+    if total == 0:
+        print(f"{label}: (empty fleet)", flush=True)
+        return
+    parts = ", ".join(
+        f"{cls}={n} ({n / total:.0%})" for cls, n in sorted(counts.items())
+    )
+    print(f"{label}: {parts}", flush=True)
 
-    if not usable:
-        raise RuntimeError("No usable 4-wheel vehicle blueprints found.")
-    return usable
 
-
-def _bp_is_truck(bp) -> bool:
-    """Truck/large-vehicle blueprint? Mirrors capture.vehicle_class_from_type_id."""
-    tid = bp.id.lower()
-    return any(tok in tid for tok in ("firetruck", "ambulance", "truck", "carlacola"))
-
-
-def split_truck_bps(vehicle_bps):
-    """Partition a blueprint list into (truck_bps, nontruck_bps)."""
-    truck = [bp for bp in vehicle_bps if _bp_is_truck(bp)]
-    nontruck = [bp for bp in vehicle_bps if not _bp_is_truck(bp)]
-    return truck, nontruck
+def log_bicycle_placement_summary(
+    world,
+    spawned_ids,
+    sidewalk_manager: BicycleSidewalkManager | None,
+) -> None:
+    """Road bicycles are in the TM fleet list; sidewalk bikes are kinematic-only."""
+    road_bikes = 0
+    for actor_id in spawned_ids:
+        try:
+            actor = world.get_actor(actor_id)
+            if actor is None or not actor.is_alive:
+                continue
+            if vehicle_class_from_type_id(actor.type_id) == "bicycle":
+                road_bikes += 1
+        except RuntimeError:
+            continue
+    sidewalk_bikes = len(sidewalk_manager.bikes) if sidewalk_manager is not None else 0
+    total = road_bikes + sidewalk_bikes
+    if total == 0:
+        print("Bicycle placement: (none)", flush=True)
+        return
+    print(
+        f"Bicycle placement: road={road_bikes} (TM fleet), "
+        f"sidewalk={sidewalk_bikes} (kinematic), total={total}",
+        flush=True,
+    )
 
 
 def truck_fraction_from_env(default=DEFAULT_TRUCK_FRACTION) -> float:
@@ -812,16 +1067,85 @@ def truck_fraction_from_env(default=DEFAULT_TRUCK_FRACTION) -> float:
     return default
 
 
-def pick_vehicle_bp(truck_bps, nontruck_bps, truck_fraction):
-    """Sample a blueprint, biasing toward trucks with probability truck_fraction.
+def pick_fleet_bp(car_bps, truck_bps, motorcycle_bps, bicycle_bps, fractions):
+    """Sample a fleet blueprint by class fraction, then uniform within class.
 
-    Used at both initial fill and recirculation so the realized car:truck mix
-    (and the number of distinct trucks over a capture) matches the target."""
-    if truck_bps and nontruck_bps:
-        if random.random() < truck_fraction:
-            return random.choice(truck_bps)
-        return random.choice(nontruck_bps)
-    return random.choice(truck_bps or nontruck_bps)
+    Used at both initial fill and recirculation so the realized mix matches the target."""
+    pools = [
+        (fractions["motorcycle"], motorcycle_bps),
+        (fractions["bicycle"], bicycle_bps),
+        (fractions["truck"], truck_bps),
+        (fractions["car"], car_bps),
+    ]
+    r = random.random()
+    cum = 0.0
+    for frac, pool in pools:
+        cum += frac
+        if r < cum:
+            if pool:
+                return random.choice(pool)
+            break
+    weighted = [(frac, pool) for frac, pool in pools if pool and frac > 0]
+    if not weighted:
+        all_pools = [p for p in (motorcycle_bps, bicycle_bps, truck_bps, car_bps) if p]
+        if not all_pools:
+            raise RuntimeError("No vehicle blueprints in any pool.")
+        return random.choice(random.choice(all_pools))
+    total = sum(frac for frac, _ in weighted)
+    r2 = random.random() * total
+    cum = 0.0
+    for frac, pool in weighted:
+        cum += frac
+        if r2 < cum:
+            return random.choice(pool)
+    return random.choice(weighted[-1][1])
+
+
+def bicycle_road_speed_reduction_pct_from_env(
+    default=DEFAULT_BICYCLE_ROAD_SPEED_REDUCTION_PCT,
+) -> float:
+    raw = os.environ.get("DATASET_BICYCLE_ROAD_SPEED_REDUCTION_PCT", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(100.0, float(raw)))
+        except ValueError:
+            pass
+    return default
+
+
+def motorcycle_road_speed_reduction_pct_from_env(
+    default=DEFAULT_MOTORCYCLE_ROAD_SPEED_REDUCTION_PCT,
+) -> float:
+    raw = os.environ.get("DATASET_MOTORCYCLE_ROAD_SPEED_REDUCTION_PCT", "").strip()
+    if raw:
+        try:
+            return max(0.0, min(100.0, float(raw)))
+        except ValueError:
+            pass
+    return default
+
+
+def _apply_fleet_autopilot(
+    traffic_manager,
+    actor,
+    bp,
+    world_map,
+    transform,
+    traffic_manager_port,
+) -> None:
+    actor.set_autopilot(True, traffic_manager_port)
+    if bp_is_bicycle(bp) and hasattr(traffic_manager, "vehicle_percentage_speed_difference"):
+        traffic_manager.vehicle_percentage_speed_difference(
+            actor, bicycle_road_speed_reduction_pct_from_env()
+        )
+    if bp_is_motorcycle(bp) and hasattr(traffic_manager, "vehicle_percentage_speed_difference"):
+        mc_pct = motorcycle_road_speed_reduction_pct_from_env()
+        if mc_pct > 0:
+            traffic_manager.vehicle_percentage_speed_difference(actor, mc_pct)
+    if free_vehicle_driving_from_env():
+        apply_free_driving_policy(traffic_manager, actor, world_map, transform)
+    else:
+        apply_straight_driving_policy(traffic_manager, actor, world_map, transform)
 
 
 def actor_max_dwell_s_from_env(default=0.0) -> float:
@@ -925,9 +1249,9 @@ def try_spawn_cars(
             flush=True,
         )
 
-    vehicle_bps = get_vehicle_blueprints(world)
-    truck_bps, nontruck_bps = split_truck_bps(vehicle_bps)
-    truck_fraction = truck_fraction_from_env()
+    car_bps, truck_bps, motorcycle_bps, bicycle_bps = get_fleet_blueprint_pools(world)
+    fractions = fleet_fractions_from_env()
+    log_fleet_mix_requested(fractions)
     spawned_ids = []
     labeled_actors = []
 
@@ -939,7 +1263,7 @@ def try_spawn_cars(
         delay_s = random.expovariate(spawn_rate_per_second)
         time.sleep(delay_s)
 
-        bp = pick_vehicle_bp(truck_bps, nontruck_bps, truck_fraction)
+        bp = pick_fleet_bp(car_bps, truck_bps, motorcycle_bps, bicycle_bps, fractions)
         if bp.has_attribute("color"):
             color = random.choice(bp.get_attribute("color").recommended_values)
             bp.set_attribute("color", color)
@@ -947,17 +1271,28 @@ def try_spawn_cars(
             driver_id = random.choice(bp.get_attribute("driver_id").recommended_values)
             bp.set_attribute("driver_id", driver_id)
 
-        actor = world.try_spawn_actor(bp, transform)
+        is_two_wheeler = bp_is_bicycle(bp) or bp_is_motorcycle(bp)
+        spawn_transforms = [transform]
+        if is_two_wheeler and len(candidate_points) > 1:
+            others = [t for t in candidate_points if t != transform]
+            extra = random.sample(others, min(TWO_WHEELER_SPAWN_ATTEMPTS - 1, len(others)))
+            spawn_transforms.extend(extra)
+
+        actor = None
+        used_transform = transform
+        for try_tf in spawn_transforms:
+            actor = world.try_spawn_actor(bp, try_tf)
+            if actor is not None:
+                used_transform = try_tf
+                break
         if actor is None:
             print(f"Skipped blocked spawn point after {delay_s:.2f}s delay.")
             continue
 
         try:
-            actor.set_autopilot(True, traffic_manager_port)
-            if free_vehicle_driving_from_env():
-                apply_free_driving_policy(traffic_manager, actor, world_map, transform)
-            else:
-                apply_straight_driving_policy(traffic_manager, actor, world_map, transform)
+            _apply_fleet_autopilot(
+                traffic_manager, actor, bp, world_map, used_transform, traffic_manager_port
+            )
         except RuntimeError:
             print("Spawned actor could not enable autopilot; destroying and skipping.")
             if actor.is_alive:
@@ -966,7 +1301,7 @@ def try_spawn_cars(
 
         moved_away, reason = wait_until_vehicle_moves_away(
             actor,
-            transform.location,
+            used_transform.location,
             min_distance_m=move_away_distance_m,
             timeout_s=move_away_timeout_s,
         )
@@ -980,15 +1315,18 @@ def try_spawn_cars(
             continue
 
         spawned_ids.append(actor.id)
-        label = f"CAR {len(spawned_ids):02d}"
+        _vtype = vehicle_class_from_type_id(bp.id).upper()
+        label = f"{_vtype} {len(spawned_ids):02d}"
         labeled_actors.append((actor, label))
         print(
-            f"Spawned {len(spawned_ids)}/{target_count} "
-            f"(actor_id={actor.id}) after {delay_s:.2f}s delay. "
+            f"Spawned {len(spawned_ids)}/{target_count} TM "
+            f"(actor_id={actor.id}, type={_vtype}) after {delay_s:.2f}s delay. "
             f"autopilot=on, driving={'free' if free_vehicle_driving_from_env() else 'lane_keep'}, "
             f"label={label}, "
             f"cleared_spawn>={move_away_distance_m:.1f}m"
         )
+
+    log_fleet_class_summary(world, spawned_ids, label="Fleet mix (realized after fill)")
 
     return (
         len(spawned_ids),
@@ -1023,7 +1361,7 @@ def main():
         traffic_manager=client.get_trafficmanager(TRAFFIC_MANAGER_PORT),
         center_index=spawn_center_index_from_env(),
         spawn_radius_m=spawn_radius_m_from_env(),
-        target_count=target_car_count_from_env(),
+        target_count=_tm_fleet_target(),
     )
 
     print(f"Spawn point total on map: {spawn_point_total}")
@@ -1055,40 +1393,83 @@ def main():
         f"Spawn gating: next spawn waits until previous moved "
         f">={move_away_distance_m:.1f} m (timeout {move_away_timeout_s:.1f}s)"
     )
-    print(f"Requested cars: {target_car_count_from_env()}")
+    if _using_count_mode():
+        _mc  = motorcycle_count_from_env()
+        _bk  = bicycle_count_from_env()
+        _sw  = round(_bk * bicycle_sidewalk_share_from_env())
+        _rbk = _bk - _sw
+        _ct  = target_car_count_from_env()
+        print(
+            f"Requested: {_ct} cars+trucks + {_mc} motorcycles + {_rbk} road bikes (TM fleet: {_ct + _mc + _rbk})"
+            f" + {_sw} sidewalk bikes (BicycleSidewalkManager) = {_ct + _mc + _bk} total"
+        )
+    else:
+        print(f"Requested fleet: {target_car_count_from_env()} (fraction mode)")
     print(f"Successfully spawned: {count}")
-    if ids:
-        print("Spawned vehicle actor IDs:", ", ".join(str(actor_id) for actor_id in ids))
-    if ids:
-        if keep_traffic_running_from_env():
-            if labeled_actors and LABEL_DURATION_S > 0:
-                threading.Thread(
-                    target=draw_vehicle_labels,
-                    args=(world, labeled_actors),
-                    kwargs={"duration_s": LABEL_DURATION_S},
-                    daemon=True,
-                ).start()
-            print(
-                "Vehicles roaming with autopilot (DATASET_KEEP_TRAFFIC_RUNNING). "
-                "Stop via Start.py Ctrl+C.",
-                flush=True,
+
+    fractions = fleet_fractions_from_env()
+    sw_target = sidewalk_bicycle_target_count(_tm_fleet_target(), fractions)
+    sidewalk_manager = None
+    if sw_target > 0:
+        _, _, _, bicycle_bps = get_fleet_blueprint_pools(world)
+        if bicycle_bps:
+            sidewalk_manager = BicycleSidewalkManager.from_world(
+                world,
+                bicycle_bps,
+                target_count=sw_target,
+                max_dwell_s=actor_max_dwell_s_from_env(),
+                client=client,
             )
-            try:
-                if spawn_exclusion_radius_m_from_env() > 0.0:
-                    recirculate_traffic_until_interrupted(
-                        traffic_manager_port, ids, spawn_center_index_from_env()
-                    )
-                else:
+            sidewalk_manager.spawn_up_to(sw_target)
+
+    log_bicycle_placement_summary(world, ids, sidewalk_manager)
+
+    try:
+        if ids:
+            print("Spawned vehicle actor IDs:", ", ".join(str(actor_id) for actor_id in ids))
+            if keep_traffic_running_from_env():
+                if labeled_actors and LABEL_DURATION_S > 0:
+                    threading.Thread(
+                        target=draw_vehicle_labels,
+                        args=(world, labeled_actors),
+                        kwargs={"duration_s": LABEL_DURATION_S},
+                        daemon=True,
+                    ).start()
+                print(
+                    "Vehicles roaming with autopilot (DATASET_KEEP_TRAFFIC_RUNNING). "
+                    "Stop via Start.py Ctrl+C.",
+                    flush=True,
+                )
+                if sidewalk_manager is not None:
+                    threading.Thread(
+                        target=sidewalk_manager.run_until_interrupt,
+                        kwargs={"poll_s": 0.05},
+                        daemon=True,
+                    ).start()
+                try:
+                    if spawn_exclusion_radius_m_from_env() > 0.0:
+                        recirculate_traffic_until_interrupted(
+                            traffic_manager_port, ids, spawn_center_index_from_env()
+                        )
+                    else:
+                        monitor_autopilot_until_interrupted(traffic_manager_port, ids)
+                except KeyboardInterrupt:
+                    print("Autopilot monitor stopped.")
+            else:
+                print(f"Drawing labels for {LABEL_DURATION_S:.0f}s")
+                draw_vehicle_labels(world, labeled_actors)
+                try:
                     monitor_autopilot_until_interrupted(traffic_manager_port, ids)
-            except KeyboardInterrupt:
-                print("Autopilot monitor stopped.")
-        else:
-            print(f"Drawing labels for {LABEL_DURATION_S:.0f}s")
-            draw_vehicle_labels(world, labeled_actors)
-            try:
-                monitor_autopilot_until_interrupted(traffic_manager_port, ids)
-            except KeyboardInterrupt:
-                print("Autopilot monitor stopped by user.")
+                except KeyboardInterrupt:
+                    print("Autopilot monitor stopped by user.")
+    finally:
+        if sidewalk_manager is not None:
+            destroyed = sidewalk_manager.destroy_all()
+            if destroyed:
+                print(
+                    f"[bicycle/sidewalk] Destroyed {destroyed} sidewalk bicycle(s) on exit.",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

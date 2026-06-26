@@ -4,8 +4,9 @@ For each (sampled) camera frame:
   - left half  : camera PNG
   - right half : top-down BEV showing all 8 radar positions, their FOV wedges,
                  every matched detection from that frame coloured by class
-                 (vehicle / pedestrian), unmatched clutter as small grey dots,
-                 and ground-truth actor footprints (rectangles) for sanity.
+                 (vehicle=blue / two_wheeler=gold / pedestrian=red), unmatched
+                 clutter as small grey dots, and ground-truth actor footprints
+                 (rectangles) for sanity.
 
 Run:
   python tools/render_bev_video.py CAPTURE_DIR OUT_MP4 [N_FRAMES] [-w WINDOW] [-s {radar,camera}]
@@ -106,7 +107,7 @@ RADAR_CSV = CAPTURE_DIR / "radar_data_labeled.csv"
 ACTOR_JSONL = CAPTURE_DIR / "actor_frames.jsonl"
 RADAR_EXTRINSICS = CAPTURE_DIR / "radar_extrinsics.csv"
 
-CLASS_COLOR = {"vehicle": "#3aaaff", "pedestrian": "#ff5b5b"}
+CLASS_COLOR = {"vehicle": "#3aaaff", "pedestrian": "#ff5b5b", "two_wheeler": "#ffd700"}
 CLUTTER_COLOR = "#555555"
 RADAR_PALETTE = [
     "#ff7070", "#70d870", "#70a8ff", "#ffc060",
@@ -149,7 +150,7 @@ if SOURCE == "radar":
             except (ValueError, IndexError):
                 continue
             radar_ticks.add(fr)
-            if len(parts) > ki and parts[ki].strip() == "vehicle":
+            if len(parts) > ki and parts[ki].strip() in ("vehicle", "two_wheeler"):
                 vehicle_ticks.add(fr)
     radar_ticks = sorted(radar_ticks)
     # Focus on a fixed window centered on a specific frame (e.g. the most vehicle-dense
@@ -374,7 +375,7 @@ for idx, (fr, cam_frame, cam_path) in enumerate(render_plan):
     if clutter_x:
         ax_bev.scatter(clutter_x, clutter_y, s=4, c=CLUTTER_COLOR, alpha=0.5, linewidths=0)
     # Matched on top, coloured per class
-    for cls in ("vehicle", "pedestrian"):
+    for cls in ("vehicle", "two_wheeler", "pedestrian"):
         xs = [d[1] for d in dets if d[3] == cls]
         ys = [d[2] for d in dets if d[3] == cls]
         if xs:
@@ -406,8 +407,24 @@ for idx, (fr, cam_frame, cam_path) in enumerate(render_plan):
 
 print(f"      done. scratch frames in {tmp_dir}", flush=True)
 print(f"[ffmpeg] encoding {OUT_MP4}...", flush=True)
+
+def _ffmpeg_exe() -> str:
+    """Return the ffmpeg executable: system PATH first, then imageio-ffmpeg bundle."""
+    import shutil as _shutil
+    if _shutil.which("ffmpeg"):
+        return "ffmpeg"
+    try:
+        import imageio.plugins.ffmpeg as _iio_ff
+        return _iio_ff.get_exe()
+    except Exception:
+        pass
+    raise FileNotFoundError(
+        "ffmpeg not found on PATH and imageio[ffmpeg] is not installed. "
+        "Install with: pip install imageio[ffmpeg]"
+    )
+
 subprocess.check_call([
-    "ffmpeg", "-y", "-loglevel", "error",
+    _ffmpeg_exe(), "-y", "-loglevel", "error",
     "-framerate", str(FPS),
     "-i", str(tmp_dir / "frame_%05d.png"),
     # matplotlib frame size depends on per-capture BEV bounds and can be odd;

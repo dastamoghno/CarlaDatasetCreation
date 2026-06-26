@@ -69,7 +69,7 @@ DEFAULT_TARGET_MEDIAN_DBSM = {
     "truck":       1.3,   # RadarScenes truck
     "bus":        -2.5,   # RadarScenes bus
     "bicycle":   -11.2,   # RadarScenes bike
-    "motorcycle": -9.0,   # not in RadarScenes; between bike and ped (moot: 4-wheel filter spawns none)
+    "motorcycle": -9.0,   # not in RadarScenes; between bike and ped
 }
 
 # Two-scale noise sigmas: (per-actor Gaussian offset, per-frame Swerling-1 scale).
@@ -697,7 +697,7 @@ def post_process_capture_dir(
                             row["rcs_dBsm"] = ""
                     except ValueError:
                         row["rcs_dBsm"] = ""
-                elif kind in ("vehicle", "pedestrian"):
+                elif kind in ("vehicle", "pedestrian", "two_wheeler"):
                     # Dynamic actor without a usable rcs_proxy_m2 — leave blank.
                     row["rcs_dBsm"] = ""
                 else:
@@ -753,7 +753,7 @@ def post_process_capture_dir(
                         # Static returns bypass SNR gating (their RCS is already a
                         # post-CFAR sample); dynamics keep the physical threshold.
                         thr = (fmcw_snr_threshold_db
-                               if kind in ("vehicle", "pedestrian")
+                               if kind in ("vehicle", "pedestrian", "two_wheeler")
                                else fmcw_snr_threshold_static_db)
                         if snr_dB_val >= thr:
                             snr_ok = rng.random() < fmcw_p_detect
