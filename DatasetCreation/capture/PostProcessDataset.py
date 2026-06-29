@@ -2,9 +2,13 @@
 
 Transforms applied in-order to radar_data_labeled.csv:
 
-1. Pedestrian Doppler fix.
-   CARLA's walker controller returns zero velocity; fix by central-differencing
-   actor_frames.jsonl positions and projecting onto sensor line-of-sight.
+1. Pedestrian + two-wheeler Doppler fix.
+   CARLA reports ~zero radial velocity for walkers (controller bug) and for
+   bicycles/motorcycles (no wheel-spin model); fix by central-differencing
+   actor_frames.jsonl positions and projecting onto sensor line-of-sight, then
+   adding a per-class micro-Doppler spread (limb swing / spinning wheels +
+   pedaling / engine) so moving articulated targets are separable from static
+   clutter — the same physics that makes them learnable in RadarScenes.
 
 2. RCS dBsm calibration + realism.
    rcs_proxy_m2 (geometric OBB area) -> rcs_dBsm with:
@@ -121,7 +125,38 @@ DEFAULT_ASPECT_AMPLITUDE_DB = {
     "motorcycle":  5.0,
 }
 
-DEFAULT_MICRO_DOPPLER_SIGMA = 1.0
+# Micro-Doppler spread: a per-detection radial-velocity jitter added ON TOP of the
+# bulk (central-differenced) velocity. It models the velocity SPREAD of moving
+# sub-parts that a single rigid-body velocity misses — the very feature that lets
+# real radar (RadarScenes) separate moving articulated/rotating targets from rigid
+# vehicles and static clutter. Per-class because the dominant mechanism differs:
+#   pedestrian  - swinging limbs (arms/legs) at walking cadence (sigma ~1 m/s).
+#   bicycle     - SPINNING WHEELS: a rim scatterer at ground speed v sweeps 0..~2v
+#                 (top of the wheel) plus pedaling-leg motion -> spread > pedestrian.
+#   motorcycle  - wheel rotation at higher road speed + engine/chassis vibration.
+# Without this, CARLA two-wheelers keep their near-zero rigid-body Doppler (CARLA
+# does not model wheel spin) and read as dim static clutter -> unlearnable (IoU
+# ~0.02). The bulk velocity provides the real signal; this spread provides the
+# learnable signature.
+#
+# CALIBRATION (not a physics guess): the two-wheeler sigmas are tuned so OUR fixed
+# two_wheeler (bicycle+motorcycle merged) SIGNED radial-velocity distribution matches
+# the RadarScenes two_wheeler target SPREAD — std ~4 m/s, p1..p99 ~ -10..+9 m/s.
+# Note RadarScenes Doppler is ego-MOTION-COMPENSATED (moving ego), so its slightly
+# positive median (+1..+2.8) is an approach-bias artifact; OUR rig is STATIC
+# (infrastructure), so our distribution is correctly centered ~0 (symmetric traffic)
+# — we match the SPREAD (variance = the learnable signal), NOT the offset. Measured
+# on bike-rich + moto-rich slices: bicycle 3.8 sets the (bike-dominated) merged std
+# to ~4.0; motorcycle 4.3 keeps the physical ordering (moto wheel/engine > bike) and
+# leaves merged std ~4.06 — both inside the RadarScenes std range (3.7-4.6).
+# DEFAULT_MICRO_DOPPLER_SIGMA is kept as the scalar pedestrian default (back-compat
+# with the existing --micro-doppler-sigma CLI arg).
+DEFAULT_MICRO_DOPPLER_SIGMA = 1.0  # pedestrian (scalar default)
+DEFAULT_MICRO_DOPPLER_SIGMA_BY_CLASS = {
+    "pedestrian": DEFAULT_MICRO_DOPPLER_SIGMA,
+    "bicycle":    3.8,   # rim up to ~2v + pedaling legs; calibrated to RadarScenes std ~4
+    "motorcycle": 4.3,   # faster wheel rotation + engine vibration (moto > bike)
+}
 DEFAULT_FD_STRIDE = 10
 DEFAULT_MAX_WALKER_SPEED_MPS = 3.0
 
@@ -203,6 +238,33 @@ def load_walker_positions(frames_path: Path) -> dict:
                     float(loc["z"]),
                 )
     return walker_pos
+
+
+def load_two_wheeler_positions(frames_path: Path) -> dict:
+    """Return {(frame_id, actor_id): (x, y, z)} for two-wheelers.
+
+    Bicycles/motorcycles are tagged kind == 'two_wheeler' here (matching the
+    labeled CSV's matched_actor_kind); the bicycle vs motorcycle split is recovered
+    from matched_actor_class in the CSV. Used to central-difference the REAL bulk
+    velocity for the two-wheeler Doppler fix, mirroring load_walker_positions.
+    """
+    twowheeler_pos: dict = {}
+    with frames_path.open(encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            frame = int(rec["frame"])
+            for a in rec.get("actors", []):
+                if a.get("kind") != "two_wheeler":
+                    continue
+                loc = a.get("location")
+                if not loc:
+                    continue
+                twowheeler_pos[(frame, int(a["id"]))] = (
+                    float(loc["x"]),
+                    float(loc["y"]),
+                    float(loc["z"]),
+                )
+    return twowheeler_pos
 
 
 def load_actor_transforms(frames_path: Path) -> dict:
@@ -385,6 +447,8 @@ def post_process_capture_dir(
     *,
     input_path=None,
     micro_doppler_sigma: float = DEFAULT_MICRO_DOPPLER_SIGMA,
+    micro_doppler_sigma_bicycle: float = DEFAULT_MICRO_DOPPLER_SIGMA_BY_CLASS["bicycle"],
+    micro_doppler_sigma_motorcycle: float = DEFAULT_MICRO_DOPPLER_SIGMA_BY_CLASS["motorcycle"],
     fd_stride: int = DEFAULT_FD_STRIDE,
     max_walker_speed: float = DEFAULT_MAX_WALKER_SPEED_MPS,
     seed: int = 0,
@@ -455,6 +519,14 @@ def post_process_capture_dir(
         print(f"      {len(walker_pos):,} (frame, walker) entries; "
               f"{len(walker_actors)} distinct walkers", flush=True)
 
+        # Two-wheeler positions feed the bulk-velocity central difference; loaded
+        # unconditionally so the velocity fix never silently depends on the
+        # aspect-modulation flag.
+        twowheeler_pos = load_two_wheeler_positions(frames_path)  # type: ignore[arg-type]
+        twowheeler_actors = {aid for (_, aid) in twowheeler_pos}
+        print(f"      {len(twowheeler_pos):,} (frame, two-wheeler) entries; "
+              f"{len(twowheeler_actors)} distinct two-wheelers", flush=True)
+
         actor_transforms: dict = {}
         if rcs_aspect_enabled:
             actor_transforms = load_actor_transforms(frames_path)  # type: ignore[arg-type]
@@ -464,6 +536,7 @@ def post_process_capture_dir(
         print("[1/4] Skipping actor data load (no actor_frames.jsonl).", flush=True)
         walker_pos = {}
         walker_actors: set = set()
+        twowheeler_pos = {}
         actor_transforms = {}
 
     # ------------------------------------------------------------------ [2/4]
@@ -522,6 +595,15 @@ def post_process_capture_dir(
     rng = random.Random(seed)
     fd  = fd_stride
 
+    # Per-class micro-Doppler spread (m/s) consumed ONLY by the two-wheeler fix [A2].
+    # Pedestrians keep using the scalar `micro_doppler_sigma` at [A] (unchanged,
+    # byte-for-byte). Two-wheelers get a larger spread (spinning wheels reach ~2v at
+    # the rim + pedaling/engine motion).
+    micro_doppler_by_class = {
+        "bicycle":    micro_doppler_sigma_bicycle,
+        "motorcycle": micro_doppler_sigma_motorcycle,
+    }
+
     actor_offset_cache: dict = {}
     frame_offset_cache: dict = {}
 
@@ -565,6 +647,7 @@ def post_process_capture_dir(
 
     stats = {
         "walker_fixed": 0, "walker_skipped": 0, "walker_clamped": 0,
+        "twowheeler_fixed": 0, "twowheeler_skipped": 0,
         "rcs_written": 0, "static_rcs": 0, "spikes": 0,
         "snr_written": 0, "visible_1": 0,
         "invis_range": 0, "invis_vel": 0, "invis_snr": 0,
@@ -639,6 +722,72 @@ def post_process_capture_dir(
                                 stats["walker_skipped"] += 1
                         else:
                             stats["walker_skipped"] += 1
+
+                # --------------------------------------------------------
+                # [A2] Two-wheeler velocity fix (bulk + wheel/pedal micro-Doppler)
+                # --------------------------------------------------------
+                # Bicycles/motorcycles are CARLA vehicles, so velocity_mps holds
+                # their rigid-body radial component. CARLA does not model wheel
+                # spin, so for bicycles this reads ~0 even while moving (median
+                # |vr| ~0.01 m/s) and they become statistically indistinguishable
+                # from static clutter -> unlearnable (IoU ~0.02). Mirror the
+                # pedestrian fix [A]:
+                #   1) recover the REAL bulk velocity by central-differencing the
+                #      actor's world position (this is genuine motion, not noise);
+                #   2) add a per-POINT micro-Doppler spread (rotating wheels: a rim
+                #      scatterer at ground speed v reaches ~2v at the top of the
+                #      wheel; plus pedaling legs / engine vibration) so the target
+                #      occupies a velocity BAND — the learnable signature that
+                #      separates two-wheelers from rigid vehicles and clutter.
+                # No walker-style speed clamp: vehicle ids are unique with continuous
+                # physics (no navmesh snap), and motorcycles legitimately move at
+                # vehicle speed; the FMCW |v|<=v_max gate is the only backstop.
+                elif aid_raw and kind == "two_wheeler":
+                    try:
+                        aid = int(aid_raw)
+                    except ValueError:
+                        aid = None
+                    if aid is not None:
+                        p_prev = twowheeler_pos.get((frame_id - fd, aid))
+                        p_next = twowheeler_pos.get((frame_id + fd, aid))
+                        p_now  = twowheeler_pos.get((frame_id, aid))
+                        if p_prev and p_next and p_now:
+                            dt  = 2.0 * fd * dt_mean
+                            vx  = (p_next[0] - p_prev[0]) / dt
+                            vy  = (p_next[1] - p_prev[1]) / dt
+                            vz  = (p_next[2] - p_prev[2]) / dt
+                            sx = float(row["sensor_world_x_m"])
+                            sy = float(row["sensor_world_y_m"])
+                            sz = float(row["sensor_world_z_m"])
+                            ux = p_now[0] - sx
+                            uy = p_now[1] - sy
+                            uz = p_now[2] - sz
+                            n  = math.sqrt(ux*ux + uy*uy + uz*uz)
+                            if n > 1e-6:
+                                ux /= n
+                                uy /= n
+                                uz /= n
+                                v_rad = vx*ux + vy*uy + vz*uz
+                                klass_2w = row["matched_actor_class"].strip()
+                                md_sigma = micro_doppler_by_class.get(klass_2w, 0.0)
+                                if md_sigma > 0:
+                                    # Per-POINT draw so detections on the same target
+                                    # span a velocity band (variance), not a single
+                                    # shifted value. Keyed deterministic RNG (not the
+                                    # shared `rng`) so the pedestrian/FMCW draw order —
+                                    # and their byte output — stays unchanged.
+                                    det_idx = row.get("detection_index", "")
+                                    md_rng = random.Random(
+                                        f"{seed}|{klass_2w}|{aid}|{frame_id}"
+                                        f"|{det_idx}|microdoppler"
+                                    )
+                                    v_rad += md_rng.gauss(0.0, md_sigma)
+                                row["velocity_mps"] = f"{v_rad:.6f}"
+                                stats["twowheeler_fixed"] += 1
+                            else:
+                                stats["twowheeler_skipped"] += 1
+                        else:
+                            stats["twowheeler_skipped"] += 1
 
                 # --------------------------------------------------------
                 # [B] RCS dBsm calibration + realism
@@ -795,6 +944,8 @@ def post_process_capture_dir(
         pct = 100.0 * stats["walker_clamped"] / max(stats["walker_fixed"], 1)
         print(f"  Walker speeds clamped       : {stats['walker_clamped']:,} "
               f"({pct:.2f}% above {max_walker_speed:.1f} m/s)", flush=True)
+    print(f"  Two-wheeler velocities fixed: {stats['twowheeler_fixed']:,}", flush=True)
+    print(f"  Two-wheeler rows skipped    : {stats['twowheeler_skipped']:,}", flush=True)
     print(f"  rcs_dBsm cells written      : {stats['rcs_written']:,}", flush=True)
     print(f"  static rcs_dBsm (RadarScenes): {stats['static_rcs']:,} "
           f"({len(static_rcs_cache):,} reflector voxels)", flush=True)
@@ -834,6 +985,14 @@ def main() -> None:
                    default=DEFAULT_MICRO_DOPPLER_SIGMA,
                    help="Gaussian stddev (m/s) added to bulk pedestrian Doppler. "
                         "0 disables.")
+    p.add_argument("--micro-doppler-sigma-bicycle", type=float,
+                   default=DEFAULT_MICRO_DOPPLER_SIGMA_BY_CLASS["bicycle"],
+                   help="Per-detection bicycle micro-Doppler spread (m/s): spinning "
+                        "wheels (rim ~2v) + pedaling legs. 0 disables.")
+    p.add_argument("--micro-doppler-sigma-motorcycle", type=float,
+                   default=DEFAULT_MICRO_DOPPLER_SIGMA_BY_CLASS["motorcycle"],
+                   help="Per-detection motorcycle micro-Doppler spread (m/s): wheel "
+                        "rotation + engine vibration. 0 disables.")
     p.add_argument("--fd-stride", type=int, default=DEFAULT_FD_STRIDE,
                    help="Central-difference stride in world ticks for walker velocity.")
     p.add_argument("--max-walker-speed", type=float,
@@ -884,6 +1043,8 @@ def main() -> None:
             args.capture_dir,
             input_path=args.input,
             micro_doppler_sigma=args.micro_doppler_sigma,
+            micro_doppler_sigma_bicycle=args.micro_doppler_sigma_bicycle,
+            micro_doppler_sigma_motorcycle=args.micro_doppler_sigma_motorcycle,
             fd_stride=args.fd_stride,
             max_walker_speed=args.max_walker_speed,
             seed=args.seed,
