@@ -73,7 +73,7 @@ FIXED_ENV = {
     "DATASET_BICYCLE_SIDEWALK_SPEED_MPS": "1.6",
     # Pinned rig geometry (not swept): low mount + shallow tilt; VFOV per user.
     "DATASET_RIG_HEIGHT_M":             "3",
-    "DATASET_RADAR_PITCH_DEG":          "8",
+    "DATASET_RADAR_PITCH_DEG":          "12",
     "DATASET_RADAR_VERTICAL_FOV_DEG":   "40",
 }
 

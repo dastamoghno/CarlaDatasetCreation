@@ -6,7 +6,7 @@ import carla
 
 # Down-tilt toward road traffic. CARLA radars use positive pitch to look down
 # (see PythonAPI/util/raycast_sensor_testing.py: Rotation(pitch=5) on radar mounts).
-RADAR_PITCH_DEG = 8.0
+RADAR_PITCH_DEG = 12.0
 
 
 def radar_pitch_deg_from_env() -> float:
